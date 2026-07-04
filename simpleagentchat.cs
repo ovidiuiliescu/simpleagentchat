@@ -122,7 +122,45 @@ internal static class Commands
 
     public static async Task<int> GoalAsync(string[] args)
     {
-        throw CliException.Usage("not_implemented", "The goal command is implemented in a later slice.");
+        var parsed = GoalArgs.Parse(args);
+        ErrorWriter.JsonMode = parsed.Json;
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+        var goals = new GoalStatusStore(workspace);
+
+        switch (parsed.Action)
+        {
+            case "status":
+            {
+                var report = goals.GetStatus(parsed.GoalName!);
+                if (parsed.Json)
+                {
+                    Console.Out.WriteLine(Json.Text(report));
+                }
+                else
+                {
+                    PlainText.WriteGoalStatus(report);
+                }
+
+                return 0;
+            }
+            case "done":
+            case "undone":
+            {
+                var message = await goals.MarkRoleStatusAsync(parsed.GoalName!, parsed.Role!, parsed.Action, parsed.WaitMs);
+                Console.Out.WriteLine(message.Id);
+                return 0;
+            }
+            case "recheck":
+            {
+                var messages = await goals.RecheckAsync(parsed.GoalName!, parsed.Reason!, parsed.WaitMs);
+                Console.Out.WriteLine($"systemCursor: {messages.SystemMessage.Id}");
+                Console.Out.WriteLine($"messageCursor: {messages.GoalMessage.Id}");
+                return 0;
+            }
+            default:
+                throw CliException.Usage("usage", "Unknown goal subcommand.");
+        }
     }
 
     public static async Task<int> ServeAsync(string[] args)
@@ -357,6 +395,161 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
     }
 
     private static int ParseWaitMs(string value)
+    {
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var waitMs) || waitMs < 0)
+        {
+            throw CliException.Validation("invalid_wait_ms", "wait-ms must be an integer from 0 through 2147483647.");
+        }
+
+        return waitMs;
+    }
+}
+
+internal sealed record GoalArgs(string Action, string? Role, string? GoalName, int WaitMs, bool Json, string? Reason)
+{
+    public static GoalArgs Parse(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs goal <status|done|undone|recheck> ...");
+        }
+
+        var action = args[0];
+        return action switch
+        {
+            "status" => ParseStatus(args.Skip(1).ToArray()),
+            "done" => ParseMark("done", args.Skip(1).ToArray()),
+            "undone" => ParseMark("undone", args.Skip(1).ToArray()),
+            "recheck" => ParseRecheck(args.Skip(1).ToArray()),
+            _ => throw CliException.Usage("usage", $"Unknown goal subcommand '{action}'.")
+        };
+    }
+
+    private static GoalArgs ParseStatus(string[] args)
+    {
+        var json = false;
+        string? goal = null;
+        foreach (var token in args)
+        {
+            if (token == "--json")
+            {
+                json = true;
+                continue;
+            }
+
+            if (token.StartsWith("-", StringComparison.Ordinal))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (goal is not null)
+            {
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs goal status <goal_file_name> [--json]");
+            }
+
+            goal = token;
+        }
+
+        if (goal is null)
+        {
+            throw CliException.Usage("usage", "goal status requires a goal file name.");
+        }
+
+        return new GoalArgs("status", null, goal, 0, json, null);
+    }
+
+    private static GoalArgs ParseMark(string action, string[] args)
+    {
+        var waitMs = 30000;
+        var positionals = new List<string>();
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token == "--wait-ms")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw CliException.Usage("usage", "--wait-ms requires a value.");
+                }
+
+                waitMs = CliParsing.ParseWaitMs(args[++i]);
+                continue;
+            }
+
+            if (token.StartsWith("-", StringComparison.Ordinal))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            positionals.Add(token);
+        }
+
+        if (positionals.Count != 2)
+        {
+            throw CliException.Usage("usage", $"Usage: dotnet simpleagentchat.cs goal {action} <role> <goal_file_name> [--wait-ms <ms>]");
+        }
+
+        return new GoalArgs(action, positionals[0], positionals[1], waitMs, false, null);
+    }
+
+    private static GoalArgs ParseRecheck(string[] args)
+    {
+        var waitMs = 30000;
+        string? goal = null;
+        string? reason = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (reason is null && token == "--")
+            {
+                reason = string.Join(" ", args.Skip(i + 1));
+                break;
+            }
+
+            if (reason is null && token == "--wait-ms")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw CliException.Usage("usage", "--wait-ms requires a value.");
+                }
+
+                waitMs = CliParsing.ParseWaitMs(args[++i]);
+                continue;
+            }
+
+            if (goal is null)
+            {
+                if (token.StartsWith("-", StringComparison.Ordinal))
+                {
+                    throw CliException.Usage("usage", $"Unknown option '{token}'.");
+                }
+
+                goal = token;
+                continue;
+            }
+
+            reason = string.Join(" ", args.Skip(i));
+            break;
+        }
+
+        if (goal is null)
+        {
+            throw CliException.Usage("usage", "goal recheck requires a goal file name.");
+        }
+
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            throw CliException.Validation("empty_reason", "goal recheck reason must be non-empty.");
+        }
+
+        return new GoalArgs("recheck", null, goal, waitMs, false, reason);
+    }
+}
+
+internal static class CliParsing
+{
+    public static int ParseWaitMs(string value)
     {
         if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var waitMs) || waitMs < 0)
         {
@@ -890,6 +1083,260 @@ Roles:
 """;
 }
 
+internal sealed class GoalStatusStore
+{
+    private readonly ChatWorkspace _workspace;
+
+    public GoalStatusStore(ChatWorkspace workspace)
+    {
+        _workspace = workspace;
+    }
+
+    public GoalStatusReport GetStatus(string goalName)
+    {
+        ValidateGoalExists(goalName);
+        var document = ReadDocument(goalName);
+        var roles = _workspace.GetRoleNames();
+        var roleStatuses = new List<GoalRoleStatus>();
+
+        foreach (var role in roles)
+        {
+            if (document.Roles.TryGetValue(role, out var entry) &&
+                string.Equals(entry.Status, "done", StringComparison.Ordinal))
+            {
+                roleStatuses.Add(new GoalRoleStatus(role, "done", entry.UpdatedAtUtc, entry.MessageId));
+            }
+            else if (document.Roles.TryGetValue(role, out var explicitEntry) &&
+                     string.Equals(explicitEntry.Status, "undone", StringComparison.Ordinal))
+            {
+                roleStatuses.Add(new GoalRoleStatus(role, "undone", explicitEntry.UpdatedAtUtc, explicitEntry.MessageId));
+            }
+            else
+            {
+                roleStatuses.Add(new GoalRoleStatus(role, "undone", null, null));
+            }
+        }
+
+        var complete = roleStatuses.Count > 0 && roleStatuses.All(status => status.Status == "done");
+        return new GoalStatusReport(goalName, complete, roleStatuses);
+    }
+
+    public async Task<Message> MarkRoleStatusAsync(string goalName, string role, string status, int waitMs)
+    {
+        ValidateGoalExists(goalName);
+        ValidateRoleExists(role);
+        if (status is not "done" and not "undone")
+        {
+            throw CliException.Validation("invalid_status", "Goal status must be done or undone.");
+        }
+
+        var store = new MessageStore(_workspace);
+        var statusPath = RootRelative(_workspace.GoalStatusPath(goalName));
+        var markdown = status == "done"
+            ? $"Role `{role}` marked goal `{goalName}` done."
+            : $"Role `{role}` marked goal `{goalName}` undone.";
+        var kind = status == "done" ? "goals.done" : "goals.undone";
+        var message = store.NewMessage(role, kind, markdown, new[] { statusPath });
+
+        await Retry.WithinAsync(waitMs, async () =>
+        {
+            var document = NormalizeDocument(goalName, ReadDocument(goalName));
+            document.Roles[role] = new RoleStatusEntry
+            {
+                Status = status,
+                UpdatedAtUtc = message.TimestampUtc,
+                MessageId = message.Id
+            };
+            SyncCurrentRoles(document, goalName);
+            WriteDocument(goalName, document);
+            await store.WriteMessageFileNoRetryAsync(message);
+            HtmlViews.RegenerateChat(_workspace);
+        });
+
+        return message;
+    }
+
+    public async Task<RecheckMessages> RecheckAsync(string goalName, string reason, int waitMs)
+    {
+        ValidateGoalExists(goalName);
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            throw CliException.Validation("empty_reason", "goal recheck reason must be non-empty.");
+        }
+
+        var store = new MessageStore(_workspace);
+        var statusPath = RootRelative(_workspace.GoalStatusPath(goalName));
+        var system = store.NewMessage(
+            "system",
+            "goals.recheck",
+            $"Goals changed. All current roles must re-check and re-approve `{goalName}`.",
+            new[] { statusPath, RootRelative(_workspace.GoalPath(goalName)) });
+        var goalMessage = store.NewMessage("goal", "chat.message", reason, Array.Empty<string>());
+
+        await Retry.WithinAsync(waitMs, async () =>
+        {
+            var document = NormalizeDocument(goalName, new GoalStatusDocument());
+            foreach (var role in _workspace.GetRoleNames())
+            {
+                document.Roles[role] = new RoleStatusEntry
+                {
+                    Status = "undone",
+                    UpdatedAtUtc = system.TimestampUtc,
+                    MessageId = system.Id
+                };
+            }
+
+            document.Complete = false;
+            WriteDocument(goalName, document);
+            await store.WriteMessageFileNoRetryAsync(system);
+            await store.WriteMessageFileNoRetryAsync(goalMessage);
+            HtmlViews.RegenerateChat(_workspace);
+        });
+
+        return new RecheckMessages(system, goalMessage);
+    }
+
+    public void ResetGoalForCurrentRoles(string goalName, string? updatedAtUtc = null, string? messageId = null)
+    {
+        ValidateGoalExists(goalName);
+        var document = NormalizeDocument(goalName, new GoalStatusDocument());
+        foreach (var role in _workspace.GetRoleNames())
+        {
+            document.Roles[role] = new RoleStatusEntry
+            {
+                Status = "undone",
+                UpdatedAtUtc = updatedAtUtc,
+                MessageId = messageId
+            };
+        }
+
+        document.Complete = false;
+        WriteDocument(goalName, document);
+    }
+
+    private void ValidateGoalExists(string goalName)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(goalName))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        if (!File.Exists(_workspace.GoalPath(goalName)))
+        {
+            throw CliException.Validation("missing_goal", $"Goal '{goalName}' does not exist.");
+        }
+    }
+
+    private void ValidateRoleExists(string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role is not a valid current agent role name.");
+        }
+
+        if (!Directory.Exists(_workspace.RoleDirectory(role)))
+        {
+            throw CliException.Validation("missing_role", $"Role '{role}' does not exist.");
+        }
+    }
+
+    private GoalStatusDocument ReadDocument(string goalName)
+    {
+        var path = _workspace.GoalStatusPath(goalName);
+        if (!File.Exists(path))
+        {
+            return NormalizeDocument(goalName, new GoalStatusDocument());
+        }
+
+        try
+        {
+            var document = JsonSerializer.Deserialize<GoalStatusDocument>(File.ReadAllText(path, Encoding.UTF8), Json.Options) ?? new GoalStatusDocument();
+            return NormalizeDocument(goalName, document);
+        }
+        catch (JsonException)
+        {
+            return NormalizeDocument(goalName, new GoalStatusDocument());
+        }
+    }
+
+    private GoalStatusDocument NormalizeDocument(string goalName, GoalStatusDocument document)
+    {
+        document.Goal = goalName;
+        document.Roles ??= new Dictionary<string, RoleStatusEntry>(StringComparer.Ordinal);
+        document.Roles = document.Roles
+            .Where(pair => NameRules.IsValidRoleName(pair.Key, allowReserved: false))
+            .ToDictionary(pair => pair.Key, pair => NormalizeEntry(pair.Value), StringComparer.Ordinal);
+        document.Complete = false;
+        return document;
+    }
+
+    private void SyncCurrentRoles(GoalStatusDocument document, string goalName)
+    {
+        var currentRoles = _workspace.GetRoleNames().ToHashSet(StringComparer.Ordinal);
+        foreach (var role in currentRoles)
+        {
+            if (!document.Roles.ContainsKey(role))
+            {
+                document.Roles[role] = new RoleStatusEntry { Status = "undone" };
+            }
+        }
+
+        foreach (var role in document.Roles.Keys.Where(role => !currentRoles.Contains(role)).ToArray())
+        {
+            document.Roles.Remove(role);
+        }
+
+        document.Goal = goalName;
+        document.Complete = currentRoles.Count > 0 && currentRoles.All(role => document.Roles.TryGetValue(role, out var entry) && entry.Status == "done");
+    }
+
+    private void WriteDocument(string goalName, GoalStatusDocument document)
+    {
+        SyncCurrentRoles(document, goalName);
+        Atomic.WriteText(_workspace.GoalStatusPath(goalName), Json.Text(document) + "\n");
+    }
+
+    private static RoleStatusEntry NormalizeEntry(RoleStatusEntry? entry)
+    {
+        if (entry is null)
+        {
+            return new RoleStatusEntry { Status = "undone" };
+        }
+
+        if (entry.Status is not "done" and not "undone")
+        {
+            entry.Status = "undone";
+            entry.UpdatedAtUtc = null;
+            entry.MessageId = null;
+        }
+
+        return entry;
+    }
+
+    private string RootRelative(string fullPath)
+    {
+        return Path.GetRelativePath(_workspace.Root, fullPath).Replace('\\', '/');
+    }
+}
+
+internal sealed class GoalStatusDocument
+{
+    public string Goal { get; set; } = "";
+    public bool Complete { get; set; }
+    public Dictionary<string, RoleStatusEntry> Roles { get; set; } = new(StringComparer.Ordinal);
+}
+
+internal sealed class RoleStatusEntry
+{
+    public string Status { get; set; } = "undone";
+    public string? UpdatedAtUtc { get; set; }
+    public string? MessageId { get; set; }
+}
+
+internal sealed record GoalStatusReport(string Goal, bool Complete, IReadOnlyList<GoalRoleStatus> Roles);
+internal sealed record GoalRoleStatus(string Role, string Status, string? UpdatedAtUtc, string? MessageId);
+internal sealed record RecheckMessages(Message SystemMessage, Message GoalMessage);
+
 internal sealed class MessageStore
 {
     private readonly ChatWorkspace _workspace;
@@ -903,31 +1350,49 @@ internal sealed class MessageStore
 
     public async Task<Message> AppendAsync(string role, string kind, string markdown, IReadOnlyList<string> changedPaths, int waitMs)
     {
+        var message = NewMessage(role, kind, markdown, changedPaths);
+        await AppendPreparedBatchAsync(new[] { message }, waitMs);
+        return message;
+    }
+
+    public Message NewMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
+    {
         if (!NameRules.IsValidMessageRole(role))
         {
             throw CliException.Validation("invalid_role", "Message role is not valid.");
         }
 
-        var message = CreateMessage(role, kind, markdown, changedPaths);
-        await Retry.WithinAsync(waitMs, async () =>
+        return CreateMessage(role, kind, markdown, changedPaths);
+    }
+
+    public Task AppendPreparedBatchAsync(IReadOnlyList<Message> messages, int waitMs)
+    {
+        return Retry.WithinAsync(waitMs, async () =>
         {
-            Directory.CreateDirectory(_workspace.MessagesDir);
-            var finalPath = Path.Combine(_workspace.MessagesDir, message.Id + ".json");
-            var tempPath = Path.Combine(_workspace.MessagesDir, "." + message.Id + "." + Guid.NewGuid().ToString("N") + ".tmp");
-            await Atomic.WriteTextAsync(tempPath, Json.Text(message) + "\n");
-            try
+            foreach (var message in messages)
             {
-                File.Move(tempPath, finalPath, overwrite: false);
-            }
-            catch
-            {
-                File.Delete(tempPath);
-                throw;
+                await WriteMessageFileNoRetryAsync(message);
             }
 
             HtmlViews.RegenerateChat(_workspace);
         });
-        return message;
+    }
+
+    internal async Task WriteMessageFileNoRetryAsync(Message message)
+    {
+        Directory.CreateDirectory(_workspace.MessagesDir);
+        var finalPath = Path.Combine(_workspace.MessagesDir, message.Id + ".json");
+        var tempPath = Path.Combine(_workspace.MessagesDir, "." + message.Id + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        await Atomic.WriteTextAsync(tempPath, Json.Text(message) + "\n");
+        try
+        {
+            File.Move(tempPath, finalPath, overwrite: false);
+        }
+        catch
+        {
+            File.Delete(tempPath);
+            throw;
+        }
     }
 
     public async Task<FetchResponse> FetchAsync(string? cursor, bool includeSystem, int waitMs)
@@ -1049,6 +1514,24 @@ internal static class PlainText
             Console.Out.WriteLine("markdown:");
             Console.Out.WriteLine(message.Markdown);
             Console.Out.WriteLine("--- end");
+        }
+    }
+
+    public static void WriteGoalStatus(GoalStatusReport report)
+    {
+        Console.Out.WriteLine($"goal: {report.Goal}");
+        Console.Out.WriteLine($"complete: {report.Complete.ToString().ToLowerInvariant()}");
+        Console.Out.WriteLine($"roleCount: {report.Roles.Count}");
+        foreach (var role in report.Roles)
+        {
+            if (string.IsNullOrWhiteSpace(role.UpdatedAtUtc))
+            {
+                Console.Out.WriteLine($"{role.Role}: {role.Status}");
+            }
+            else
+            {
+                Console.Out.WriteLine($"{role.Role}: {role.Status} {role.UpdatedAtUtc}");
+            }
         }
     }
 }
