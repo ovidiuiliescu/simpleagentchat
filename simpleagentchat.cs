@@ -36,6 +36,7 @@ internal static class Program
                 throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|goal> ...");
             }
 
+            ErrorWriter.JsonMode = WantsJsonErrors(args);
             var command = args[0];
             var rest = args.Skip(1).ToArray();
             return command switch
@@ -58,6 +59,13 @@ internal static class Program
             ErrorWriter.Write(new CliException(1, "unexpected_error", ex.Message));
             return 1;
         }
+    }
+
+    private static bool WantsJsonErrors(string[] args)
+    {
+        return args.Length > 1 &&
+               (args[0] == "fetch" || args[0] == "goal") &&
+               args.Skip(1).Any(arg => arg == "--json");
     }
 }
 
@@ -2361,6 +2369,7 @@ internal static class UiShell
 <style>
 :root{color-scheme:light;--bg:#f7f7f4;--panel:#ffffff;--line:#d8d8d2;--text:#1d1d1f;--muted:#5f6368;--accent:#1b6f5c;--danger:#a83a32}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,sans-serif}
 header{position:sticky;top:0;z-index:2;background:#fffffff2;border-bottom:1px solid var(--line);padding:12px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 h1{font-size:18px;margin:0}
@@ -2376,14 +2385,19 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .row>*{flex:1}
 .row button,.row input[type=checkbox]{flex:0 0 auto}
+.fields{display:grid;gap:10px}
+.field{display:grid;gap:5px}
+.field span{color:var(--muted);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.formbar{display:grid;grid-template-columns:minmax(130px,1fr) minmax(130px,1fr) auto auto;gap:8px;align-items:end}
+.formbar.assets{grid-template-columns:minmax(130px,1fr) minmax(170px,1fr) auto}
 .tabs{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .tabs button[aria-selected=true]{background:#173d36;color:#fff;border-color:#173d36}
 iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);background:#fff}
 .list{display:grid;gap:6px;margin:8px 0}
 .item{display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:8px;background:#fff}
 .muted{color:var(--muted);font-size:13px}
-.stack{display:grid;gap:10px}
-@media(max-width:900px){main{grid-template-columns:1fr}iframe{height:52vh}}
+.stack{display:grid;gap:12px}
+@media(max-width:900px){main{grid-template-columns:1fr}iframe{height:52vh}.formbar,.formbar.assets{grid-template-columns:1fr}.formbar button{width:100%}}
 </style>
 </head>
 <body>
@@ -2405,17 +2419,17 @@ iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);backg
 </div>
 <div class="body">
 <div id="rolesPanel" class="stack">
-<div class="row"><select id="roleSelect" onchange="loadRole()"></select><input id="roleName" placeholder="new-role"><button onclick="saveRole()">Save</button><button class="danger" onclick="deleteRole()">Delete</button></div>
-<label>Instructions<textarea id="roleInstructions"></textarea></label>
-<label>Memory<textarea id="roleMemory"></textarea></label>
+<div class="formbar"><label class="field"><span>Role</span><select id="roleSelect" onchange="loadRole()"></select></label><label class="field"><span>Name</span><input id="roleName" placeholder="new-role"></label><button onclick="saveRole()">Save</button><button class="danger" onclick="deleteRole()">Delete</button></div>
+<label class="field"><span>Instructions</span><textarea id="roleInstructions"></textarea></label>
+<label class="field"><span>Memory</span><textarea id="roleMemory"></textarea></label>
 <div class="row"><button onclick="saveRoleInstructions()">Save instructions</button><button onclick="saveRoleMemory()">Save memory</button></div>
 </div>
 <div id="goalsPanel" class="stack" hidden>
-<div class="row"><select id="goalSelect" onchange="loadGoal()"></select><input id="goalName" placeholder="goal.md"><button onclick="saveGoal()">Save</button><button class="danger" onclick="deleteGoal()">Delete</button></div>
-<textarea id="goalContent"></textarea>
+<div class="formbar"><label class="field"><span>Goal</span><select id="goalSelect" onchange="loadGoal()"></select></label><label class="field"><span>Name</span><input id="goalName" placeholder="goal.md"></label><button onclick="saveGoal()">Save</button><button class="danger" onclick="deleteGoal()">Delete</button></div>
+<label class="field"><span>Content</span><textarea id="goalContent"></textarea></label>
 </div>
 <div id="assetsPanel" class="stack" hidden>
-<div class="row"><input id="assetName" placeholder="asset.txt"><input id="assetFile" type="file"><button onclick="uploadAsset()">Upload</button></div>
+<div class="formbar assets"><label class="field"><span>Name</span><input id="assetName" placeholder="asset.txt"></label><label class="field"><span>File</span><input id="assetFile" type="file"></label><button onclick="uploadAsset()">Upload</button></div>
 <div id="assetList" class="list"></div>
 </div>
 </div>
@@ -2425,7 +2439,8 @@ iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);backg
 const $=id=>document.getElementById(id);
 function setStatus(text){$('status').textContent=text}
 async function api(path, options){const r=await fetch(path, options); if(!r.ok){throw new Error(await r.text())} return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
-async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets()]); $('chatFrame').src='/chat.html?ts='+Date.now(); setStatus('Refreshed')}
+function refreshChat(){ $('chatFrame').src='/chat.html?ts='+Date.now() }
+async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets()]); refreshChat(); setStatus('Refreshed')}
 async function sendMessage(){await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; await refreshAll()}
 function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
 async function loadRoles(){const data=await api('/api/roles'); $('roleSelect').innerHTML=data.roles.map(r=>`<option>${r.role}</option>`).join(''); if(data.roles.length) await loadRole()}
@@ -2441,6 +2456,7 @@ async function deleteGoal(){const name=$('goalSelect').value; if(name){await api
 async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span></div>`).join('')}
 async function uploadAsset(){const file=$('assetFile').files[0]; const name=$('assetName').value || file?.name; if(!file||!name)return; await fetch('/api/assets/'+encodeURIComponent(name),{method:'PUT',body:file}).then(async r=>{if(!r.ok)throw new Error(await r.text())}); await refreshAll()}
 refreshAll().catch(e=>setStatus(e.message));
+setInterval(refreshChat,5000);
 </script>
 </body>
 </html>
