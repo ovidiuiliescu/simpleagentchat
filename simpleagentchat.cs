@@ -1034,7 +1034,7 @@ internal sealed class ChatWorkspace
     private static string DefaultRoleInstructions(string role) => role switch
     {
         "implementer" => "# Implementer Role\n\nImplement the goal cleanly and efficiently. Prefer pragmatic DRY and YAGNI. Fetch before meaningful work, read current goals and role memory, and wait for a human `Start` unless one already appears in fetched history.\n",
-        "reviewer" => "# Reviewer Role\n\nReview work for correctness, risks, regressions, missing tests, and clarity. Fetch before meaningful review, read current goals and role memory, and mark goals done only after checking the implementation from this role's responsibility.\n",
+        "reviewer" => "# Reviewer Role\n\nPerform a thorough code review. Look for gaps the implementer may have missed, flag serious concerns clearly, and if you are unsure why the implementation is done a certain way, ask a question in the chat. Fetch before meaningful review, read current goals and role memory, and mark goals done only after checking the implementation from this role's responsibility.\n",
         _ => $"# {role} Role\n\nFollow HOW_TO_CHAT.md. Read this file, role_memory.md, and current goals before participating.\n"
     };
 }

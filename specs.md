@@ -212,7 +212,7 @@ Each role is a directory containing instructions and long-term role memory.
 Default roles:
 
 - `implementer/instructions.md`: implements the goal cleanly and efficiently using pragmatic DRY and YAGNI principles.
-- `reviewer/instructions.md`: reviews work for correctness, risks, regressions, missing tests, and clarity.
+- `reviewer/instructions.md`: performs a thorough code review, looks for gaps the implementer may have missed, flags serious concerns clearly, and asks questions in chat when implementation choices are unclear.
 
 Each role directory also contains:
 

@@ -14,6 +14,7 @@ internal static class SimpleAgentChatTests
             ("goal parser handles status, mark, and recheck forms", TestGoalParser),
             ("serve parser handles port and browser options", TestServeParser),
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
+            ("initialization creates implementer and reviewer default roles", TestDefaultRoles),
             ("goal status store computes current role completion", TestGoalStatusStore)
         };
 
@@ -118,6 +119,32 @@ internal static class SimpleAgentChatTests
         Assert(!html.Contains("<script>", StringComparison.OrdinalIgnoreCase), "raw script tag should not survive");
         Assert(html.Contains("&lt;script&gt;alert(1)&lt;/script&gt;", StringComparison.Ordinal), "script should be escaped");
         Assert(html.Contains("<strong>safe</strong>", StringComparison.Ordinal), "bold should render");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestDefaultRoles()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            var roles = workspace.GetRoleNames();
+            Assert(roles.SequenceEqual(new[] { "implementer", "reviewer" }), "default roles should be implementer and reviewer");
+
+            var reviewerInstructions = File.ReadAllText(Path.Combine(workspace.RoleDirectory("reviewer"), "instructions.md"));
+            Assert(reviewerInstructions.Contains("Perform a thorough code review.", StringComparison.Ordinal), "reviewer should ask for a thorough code review");
+            Assert(reviewerInstructions.Contains("gaps the implementer may have missed", StringComparison.Ordinal), "reviewer should look for implementer gaps");
+            Assert(reviewerInstructions.Contains("ask a question in the chat", StringComparison.Ordinal), "reviewer should ask questions when unclear");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
         return Task.CompletedTask;
     }
 
