@@ -2030,7 +2030,8 @@ internal sealed class LocalServer
                     name,
                     length = file.Exists ? file.Length : 0,
                     updatedAtUtc = file.Exists ? Time.RoundTrip(file.LastWriteTimeUtc) : null,
-                    complete = status.Complete
+                    complete = status.Complete,
+                    status
                 };
             }).ToArray();
             await WriteJsonAsync(context, 200, new { goals });
@@ -2083,7 +2084,8 @@ internal sealed class LocalServer
             throw new ApiException(404, "missing_goal", $"Goal '{name}' does not exist.");
         }
 
-        return new { name, content = File.ReadAllText(path, Encoding.UTF8) };
+        var status = new GoalStatusStore(_workspace).GetStatus(name);
+        return new { name, content = File.ReadAllText(path, Encoding.UTF8), status };
     }
 
     private async Task PutGoalAsync(HttpListenerContext context, string name)
@@ -2862,17 +2864,18 @@ internal static class UiShell
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>simpleagentchat</title>
 <style>
-:root{color-scheme:light;--bg:#f7f7f4;--panel:#ffffff;--line:#d8d8d2;--text:#1d1d1f;--muted:#5f6368;--accent:#1b6f5c;--danger:#a83a32}
+:root{color-scheme:light;--bg:#f7f7f4;--panel:#ffffff;--line:#d8d8d2;--text:#1d1d1f;--muted:#5f6368;--accent:#1b6f5c;--danger:#a83a32;--warning:#8a4600}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,sans-serif}
 header{position:sticky;top:0;z-index:2;background:#fffffff2;border-bottom:1px solid var(--line);padding:12px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 h1{font-size:18px;margin:0}
-main{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(320px,.9fr);gap:16px;padding:16px;max-width:1380px;margin:0 auto}
+main{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(420px,.95fr);gap:16px;padding:16px;width:100%;max-width:none}
 section{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0}
 section h2{font-size:15px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line)}
 .body{padding:12px 14px}
 textarea,input,select{width:100%;border:1px solid var(--line);border-radius:6px;padding:9px;font:inherit;background:#fff;color:var(--text)}
+textarea:focus,input:focus,select:focus{outline:2px solid #b9d7ce;outline-offset:1px}
 textarea{min-height:120px;resize:vertical}
 button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:8px 10px;font:inherit;cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -2885,10 +2888,15 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 .critical-toggle input{width:auto;margin:0}
 .fields{display:grid;gap:10px}
 .field{display:grid;gap:5px}
-.field span{color:var(--muted);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.field span{color:var(--muted);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0}
+.field.required>span::after{content:" *";color:var(--danger)}
+.field.required input:required:invalid,.field.required select:required:invalid,.field.required textarea:required:invalid{border-color:var(--danger);box-shadow:0 0 0 1px var(--danger)}
 .formbar{display:grid;grid-template-columns:minmax(130px,1fr) minmax(130px,1fr) auto auto;gap:8px;align-items:end}
-.formbar.manage{grid-template-columns:minmax(120px,1fr) minmax(120px,1fr) auto auto auto}
 .formbar.assets{grid-template-columns:minmax(130px,1fr) minmax(170px,1fr) auto}
+.management{display:grid;gap:8px}
+.management-fields{display:grid;grid-template-columns:minmax(160px,1fr) minmax(180px,1fr);gap:8px;align-items:end}
+.management-actions{display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
+.management-actions button{min-width:112px}
 .tabs{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .tabs button[aria-selected=true]{background:#173d36;color:#fff;border-color:#173d36}
 .chat-log{height:62vh;overflow:auto;border-bottom:1px solid var(--line);background:#fff;padding:12px 14px}
@@ -2907,7 +2915,17 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 .item{display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:8px;background:#fff}
 .muted{color:var(--muted);font-size:13px}
 .stack{display:grid;gap:12px}
-@media(max-width:900px){main{grid-template-columns:1fr}.chat-log{height:52vh}.formbar,.formbar.manage,.formbar.assets{grid-template-columns:1fr}.formbar button{width:100%}}
+.goal-status-list{display:grid;gap:8px}
+.goal-status-card{border:1px solid var(--line);border-radius:6px;background:#fff;overflow:hidden}
+.goal-status-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-bottom:1px solid var(--line);font-weight:700}
+.goal-status-roles{display:grid}
+.goal-status-row{display:grid;grid-template-columns:minmax(120px,1fr) auto minmax(140px,1fr);gap:8px;align-items:center;padding:8px 10px;border-top:1px solid #ededdf}
+.goal-status-row:first-child{border-top:0}
+.status-pill{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;white-space:nowrap}
+.status-pill.done,.status-pill.complete{color:#11533f;border-color:#98c7b8;background:#eef8f3}
+.status-pill.undone,.status-pill.incomplete{color:var(--warning);border-color:#e1bb7e;background:#fff7e6}
+.empty{color:var(--muted);margin:0}
+@media(max-width:900px){main{grid-template-columns:1fr}.chat-log{height:52vh}.formbar,.formbar.assets,.management-fields{grid-template-columns:1fr}.formbar button,.management-actions button{width:100%}.management-actions{justify-content:stretch}.goal-status-row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -2929,13 +2947,14 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 </div>
 <div class="body">
 <div id="rolesPanel" class="stack">
-<div class="formbar manage"><label class="field"><span>Role</span><select id="roleSelect" onchange="loadRole()"></select></label><label class="field"><span>Name</span><input id="roleName" placeholder="new-role"></label><button onclick="renameRole()">Rename</button><button onclick="addRole()">Add new role</button><button class="danger" onclick="deleteRole()">Delete</button></div>
+<div class="management"><div class="management-fields"><label class="field required"><span>Role</span><select id="roleSelect" required onchange="loadRole()"></select></label><label class="field required"><span>Name</span><input id="roleName" required placeholder="new-role"></label></div><div class="management-actions"><button onclick="renameRole()">Rename</button><button onclick="addRole()">Add new role</button><button class="danger" onclick="deleteRole()">Delete</button></div></div>
 <label class="field"><span>Instructions</span><textarea id="roleInstructions"></textarea></label>
 <label class="field"><span>Memory</span><textarea id="roleMemory"></textarea></label>
 <div class="row"><button onclick="saveRoleInstructions()">Save instructions</button><button onclick="saveRoleMemory()">Save memory</button></div>
 </div>
 <div id="goalsPanel" class="stack" hidden>
-<div class="formbar manage"><label class="field"><span>Goal</span><select id="goalSelect" onchange="loadGoal()"></select></label><label class="field"><span>Name</span><input id="goalName" placeholder="goal.md"></label><button onclick="renameGoal()">Rename</button><button onclick="addGoal()">Add new goal</button><button class="danger" onclick="deleteGoal()">Delete</button></div>
+<div class="management"><div class="management-fields"><label class="field required"><span>Goal</span><select id="goalSelect" required onchange="loadGoal()"></select></label><label class="field required"><span>Name</span><input id="goalName" required placeholder="goal.md"></label></div><div class="management-actions"><button onclick="renameGoal()">Rename</button><button onclick="addGoal()">Add new goal</button><button class="danger" onclick="deleteGoal()">Delete</button></div></div>
+<div id="goalStatus" class="goal-status-list" aria-live="polite"></div>
 <label class="field"><span>Content</span><textarea id="goalContent"></textarea></label>
 <div class="row"><button onclick="saveGoal()">Save goal</button></div>
 </div>
@@ -2963,23 +2982,29 @@ async function loadNewMessages(){const state=chatScrollState(); const query='/ap
 async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets(),refreshChat()]); setStatus('Refreshed')}
 async function sendMessage(){const state=chatScrollState(); const data=await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; renderChat([data.message],false); chatCursor=data.nextCursor||data.message?.id||chatCursor; restoreChatScroll(state); setStatus('Sent')}
 function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
-async function loadRoles(selected){const data=await api('/api/roles'); $('roleSelect').innerHTML=data.roles.map(r=>`<option>${r.role}</option>`).join(''); if(selected){$('roleSelect').value=selected} if(data.roles.length) await loadRole(); else {$('roleName').value=''; $('roleInstructions').value=''; $('roleMemory').value=''}}
+function replaceOptions(select, values){select.textContent=''; for(const value of values){const option=document.createElement('option'); option.value=value; option.textContent=value; select.appendChild(option)}}
+function requiredValue(id){const element=$(id); const value=element.value.trim(); if(!value){element.reportValidity?.(); element.focus(); return null} return value}
+async function loadRoles(selected){const current=selected||$('roleSelect').value; const data=await api('/api/roles'); const roles=data.roles||[]; replaceOptions($('roleSelect'),roles.map(r=>r.role)); if(current && roles.some(r=>r.role===current)){$('roleSelect').value=current} if(roles.length) await loadRole(); else {$('roleName').value=''; $('roleInstructions').value=''; $('roleMemory').value=''}}
 async function loadRole(){const role=$('roleSelect').value; if(!role)return; const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory}
-async function addRole(){const role=$('roleName').value.trim(); if(!role)return; await api('/api/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role,instructions:$('roleInstructions').value,memory:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
-async function renameRole(){const role=$('roleSelect').value; const next=$('roleName').value.trim(); if(!role||!next)return; await api('/api/roles/'+encodeURIComponent(role)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:next})}); await loadRoles(next); await loadNewMessages()}
+async function addRole(){const role=requiredValue('roleName'); if(!role)return; await api('/api/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role,instructions:$('roleInstructions').value,memory:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
+async function renameRole(){const role=$('roleSelect').value; const next=requiredValue('roleName'); if(!role||!next)return; await api('/api/roles/'+encodeURIComponent(role)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:next})}); await loadRoles(next); await loadNewMessages()}
 async function saveRoleInstructions(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles(role); await loadNewMessages()}
 async function saveRoleMemory(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
 async function deleteRole(){const role=$('roleSelect').value; if(role){await api('/api/roles/'+encodeURIComponent(role),{method:'DELETE'}); await refreshAll()}}
-async function loadGoals(selected){const data=await api('/api/goals'); $('goalSelect').innerHTML=data.goals.map(g=>`<option>${g.name}</option>`).join(''); if(selected){$('goalSelect').value=selected} if(data.goals.length) await loadGoal(); else {$('goalName').value=''; $('goalContent').value=''}}
-async function loadGoal(){const name=$('goalSelect').value; if(!name)return; const data=await api('/api/goals/'+encodeURIComponent(name)); $('goalName').value=data.name; $('goalContent').value=data.content}
-async function addGoal(){const name=$('goalName').value.trim(); if(!name)return; await api('/api/goals',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,content:$('goalContent').value})}); await loadGoals(name); await loadNewMessages()}
-async function renameGoal(){const name=$('goalSelect').value; const next=$('goalName').value.trim(); if(!name||!next)return; await api('/api/goals/'+encodeURIComponent(name)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:next})}); await loadGoals(next); await loadNewMessages()}
+let goalsCache=[];
+function statusText(status){return status==='done'?'Done':'Incomplete'}
+function statusClass(status){return status==='done'?'done':'undone'}
+function renderGoalStatuses(goals){const root=$('goalStatus'); root.textContent=''; if(!goals.length){const empty=document.createElement('p'); empty.className='empty'; empty.textContent='No goals yet.'; root.appendChild(empty); return} const selected=$('goalSelect').value; for(const goal of goals){const report=goal.status||{}; const roles=Array.isArray(report.roles)?report.roles:[]; const card=document.createElement('article'); card.className='goal-status-card'; if(goal.name===selected){card.className+=' current'} const head=document.createElement('div'); head.className='goal-status-head'; const title=document.createElement('span'); title.textContent=text(goal.name); const goalPill=document.createElement('span'); goalPill.className='status-pill '+(goal.complete?'complete':'incomplete'); goalPill.textContent=goal.complete?'Complete':'Incomplete'; head.appendChild(title); head.appendChild(goalPill); card.appendChild(head); const list=document.createElement('div'); list.className='goal-status-roles'; if(roles.length===0){const row=document.createElement('div'); row.className='goal-status-row'; row.textContent='No current roles.'; list.appendChild(row)} for(const role of roles){const row=document.createElement('div'); row.className='goal-status-row'; const name=document.createElement('strong'); name.textContent=text(role.role); const pill=document.createElement('span'); pill.className='status-pill '+statusClass(role.status); pill.textContent=statusText(role.status); const updated=document.createElement('span'); updated.className='muted'; updated.textContent=role.updatedAtUtc?text(role.updatedAtUtc):'No update yet'; row.appendChild(name); row.appendChild(pill); row.appendChild(updated); list.appendChild(row)} card.appendChild(list); root.appendChild(card)}}
+async function loadGoals(selected){const current=selected||$('goalSelect').value; const data=await api('/api/goals'); goalsCache=data.goals||[]; replaceOptions($('goalSelect'),goalsCache.map(g=>g.name)); if(current && goalsCache.some(g=>g.name===current)){$('goalSelect').value=current} renderGoalStatuses(goalsCache); if(goalsCache.length) await loadGoal(); else {$('goalName').value=''; $('goalContent').value=''}}
+async function loadGoal(){const name=$('goalSelect').value; renderGoalStatuses(goalsCache); if(!name)return; const data=await api('/api/goals/'+encodeURIComponent(name)); $('goalName').value=data.name; $('goalContent').value=data.content; if(data.status){goalsCache=goalsCache.map(goal=>goal.name===data.name?{...goal,complete:data.status.complete,status:data.status}:goal); renderGoalStatuses(goalsCache)}}
+async function addGoal(){const name=requiredValue('goalName'); if(!name)return; await api('/api/goals',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,content:$('goalContent').value})}); await loadGoals(name); await loadNewMessages()}
+async function renameGoal(){const name=$('goalSelect').value; const next=requiredValue('goalName'); if(!name||!next)return; await api('/api/goals/'+encodeURIComponent(name)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:next})}); await loadGoals(next); await loadNewMessages()}
 async function saveGoal(){const name=$('goalSelect').value; if(!name)return; await api('/api/goals/'+encodeURIComponent(name),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:$('goalContent').value})}); await loadGoals(name); await loadNewMessages()}
 async function deleteGoal(){const name=$('goalSelect').value; if(name){await api('/api/goals/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}}
 async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span><button class="danger" onclick="deleteAsset('${a.name}')">Delete</button></div>`).join('')}
 async function uploadAsset(){const file=$('assetFile').files[0]; const name=$('assetName').value || file?.name; if(!file||!name)return; await fetch('/api/assets/'+encodeURIComponent(name),{method:'PUT',body:file}).then(async r=>{if(!r.ok)throw new Error(await r.text())}); await refreshAll()}
 async function deleteAsset(name){await api('/api/assets/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}
-function connectEvents(){if(!window.EventSource){setInterval(()=>loadNewMessages().catch(e=>setStatus(e.message)),30000); return} const events=new EventSource('/api/events'); events.onopen=()=>setStatus('Live'); events.addEventListener('messages',()=>loadNewMessages().catch(e=>setStatus(e.message))); events.addEventListener('roles',()=>{loadRoles().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('goals',()=>{loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('assets',()=>loadAssets().catch(e=>setStatus(e.message))); events.onerror=()=>setStatus('Reconnecting')}
+function connectEvents(){if(!window.EventSource){setInterval(()=>{loadNewMessages().catch(e=>setStatus(e.message)); loadGoals().catch(e=>setStatus(e.message))},30000); return} const events=new EventSource('/api/events'); events.onopen=()=>setStatus('Live'); events.addEventListener('messages',()=>loadNewMessages().catch(e=>setStatus(e.message))); events.addEventListener('roles',()=>{loadRoles().catch(e=>setStatus(e.message)); loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('goals',()=>{loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('assets',()=>loadAssets().catch(e=>setStatus(e.message))); events.onerror=()=>setStatus('Reconnecting')}
 refreshAll().catch(e=>setStatus(e.message));
 connectEvents();
 </script>

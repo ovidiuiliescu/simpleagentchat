@@ -184,6 +184,14 @@ internal static class SimpleAgentChatTests
         Assert(UiShell.Html.Contains("renameGoal()", StringComparison.Ordinal), "goal rename action missing");
         Assert(UiShell.Html.Contains("saveGoal()", StringComparison.Ordinal), "goal save action missing");
         Assert(UiShell.Html.Contains("deleteAsset", StringComparison.Ordinal), "asset delete action missing");
+        Assert(UiShell.Html.Contains("id=\"goalStatus\"", StringComparison.Ordinal), "goal status panel missing");
+        Assert(UiShell.Html.Contains("renderGoalStatuses", StringComparison.Ordinal), "goal status renderer missing");
+        Assert(UiShell.Html.Contains("goal.status||{}", StringComparison.Ordinal), "goal status data binding missing");
+        Assert(UiShell.Html.Contains("management-actions", StringComparison.Ordinal), "management buttons should be on a separate row");
+        Assert(UiShell.Html.Contains("field required", StringComparison.Ordinal), "required field marker class missing");
+        Assert(UiShell.Html.Contains("content:\" *\"", StringComparison.Ordinal), "required field star missing");
+        Assert(UiShell.Html.Contains(":required:invalid", StringComparison.Ordinal), "required empty field styling missing");
+        Assert(UiShell.Html.Contains("width:100%;max-width:none", StringComparison.Ordinal), "main layout should use full page width");
         Assert(UiShell.Html.Contains("EventSource('/api/events')", StringComparison.Ordinal), "live event stream missing");
         Assert(UiShell.Html.Contains("id=\"chatLog\"", StringComparison.Ordinal), "chat log container missing");
         Assert(UiShell.Html.Contains("renderChat", StringComparison.Ordinal), "client-side chat rendering missing");
@@ -193,6 +201,7 @@ internal static class SimpleAgentChatTests
         Assert(!UiShell.Html.Contains("<iframe", StringComparison.OrdinalIgnoreCase), "chat UI should not use iframe");
         Assert(!UiShell.Html.Contains("chatFrame", StringComparison.Ordinal), "chat UI should not depend on chatFrame");
         Assert(!UiShell.Html.Contains("onclick=\"saveRole()\"", StringComparison.Ordinal), "role save should not create implicitly");
+        Assert(!UiShell.Html.Contains("formbar manage", StringComparison.Ordinal), "management buttons should not share the field row");
         Assert(!UiShell.Html.Contains("setInterval(refreshChat,5000)", StringComparison.Ordinal), "chat should not depend on fixed refresh polling when events are available");
         return Task.CompletedTask;
     }

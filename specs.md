@@ -312,8 +312,15 @@ This is the local-server UI shell used by `serve`. It must include:
 - role editor
 - role memory/thoughts editor
 - goal editor
+- current per-role completion status for every goal
 - asset browser or upload form
 - controls for sending critical messages
+
+The local-server UI should use the full browser width available to it. Role and goal management controls should keep rename, add, and delete buttons on a separate action row from the selected item and name fields.
+
+Mandatory fields, including role names and goal names, should show a red `*` next to the field label and should render with a red border while empty.
+
+The goal page should refresh displayed goal status in real time when role agents mark goals `done` or `undone`.
 
 The UI should call the local server started by:
 
@@ -410,6 +417,7 @@ The server should let the human:
 - create, edit, and delete role instructions
 - view and edit role memory/thoughts files
 - create, edit, and delete goal files
+- view current per-role completion status for every goal
 - view assets
 - upload assets using safe asset filenames
 - view the rendered chat transcript
@@ -953,7 +961,7 @@ Endpoint contracts:
 - `GET /` serves `ui.html`.
 - `GET /chat.html` serves an on-demand read-only transcript without writing `.simpleagentchat/chat.html`.
 - `GET /api/messages` returns the same core JSON schema as `fetch --json`, with an additional `html` field on each message for safe browser rendering. For UI use and cursor-based polling, `includeSystem` should default to `true`; for no-cursor agent CLI fetches it defaults to `false`.
-- `GET /api/events` returns a Server-Sent Events stream that notifies browser clients when messages, roles, goals, or assets change. The server should watch the chat files so messages written by agent CLI commands refresh the browser UI without manual polling.
+- `GET /api/events` returns a Server-Sent Events stream that notifies browser clients when messages, roles, goals, goal status files, or assets change. The server should watch the chat files so messages written by agent CLI commands refresh the browser UI without manual polling.
 - `POST /api/messages` accepts `{ "markdown": "...", "critical": false }`, writes a `human` message, and returns the created message object plus `nextCursor`. If `critical` is `true` and the trimmed Markdown does not start with `!`, the server prepends `! ` before writing the message.
 - `GET /api/roles` returns role names and metadata for valid role directories.
 - `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, rejects existing roles, and emits a `roles.changed` system message.
@@ -962,9 +970,9 @@ Endpoint contracts:
 - `PUT /api/roles/<role>/memory` accepts `{ "markdown": "..." }`, writes `role_memory.md`, and emits a `roles.memory.changed` system message because the edit came through the human/UI channel.
 - `POST /api/roles/<role>/rename` accepts `{ "role": "new-role" }`, renames the current role, rejects existing target roles, preserves instructions and memory, updates goal status metadata for the renamed role, and emits a `roles.changed` system message.
 - `DELETE /api/roles/<role>` deletes that role directory and emits a critical `roles.deleted` system message whose Markdown starts with `!`.
-- `GET /api/goals` returns safe goal file names and metadata.
+- `GET /api/goals` returns safe goal file names, metadata, a `complete` flag, and a `status` object containing the current per-role goal status report.
 - `POST /api/goals` accepts `{ "name": "...", "content": "..." }`, creates a new goal, rejects existing goals, resets completion status for all current roles, and emits a `goals.changed` system message.
-- `GET /api/goals/<name>` returns `{ "name": "...", "content": "..." }`.
+- `GET /api/goals/<name>` returns `{ "name": "...", "content": "...", "status": ... }`, where `status` contains the same current per-role goal status report used by `goal status --json`.
 - `PUT /api/goals/<name>` accepts `{ "content": "..." }`, writes the goal file, resets completion status for that goal to `undone` for all current roles, and emits a `goals.changed` system message.
 - `POST /api/goals/<name>/rename` accepts `{ "name": "new-name.md" }`, renames the current goal, rejects existing target goals, preserves the goal content and status metadata, and emits a `goals.changed` system message.
 - `DELETE /api/goals/<name>` deletes the goal file, deletes the goal status file if present, and emits a `goals.changed` system message.
