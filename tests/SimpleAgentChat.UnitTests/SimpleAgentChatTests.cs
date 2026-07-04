@@ -168,8 +168,10 @@ internal static class SimpleAgentChatTests
     private static Task TestHowToChatRequiresListening()
     {
         var block = MarkdownBlocks.HowToChatBlock();
+        Assert(block.Contains("dotnet run --file .\\simpleagentchat.cs --no-build -- <command>", StringComparison.Ordinal), "concurrent-safe command form missing");
+        Assert(block.Contains("dotnet build .\\simpleagentchat.cs", StringComparison.Ordinal), "build cache seed guidance missing");
         Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen", StringComparison.Ordinal), "join listening warning missing");
-        Assert(block.Contains("fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "long wait fetch example missing");
+        Assert(block.Contains("dotnet run --file .\\simpleagentchat.cs --no-build -- fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "long wait fetch example missing");
         Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
         Assert(block.Contains("until the goal is done or a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
         Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");

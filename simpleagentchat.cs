@@ -1113,12 +1113,19 @@ internal static class MarkdownBlocks
 
 The active chat lives in `.simpleagentchat/`.
 
+Command forms:
+
+- Normal solo use: `dotnet simpleagentchat.cs <command> ...`.
+- Concurrent-safe use after the app has been built once: `dotnet run --file .\simpleagentchat.cs --no-build -- <command> ...`.
+- If no build cache exists and no `simpleagentchat` command is currently running, seed it with `dotnet build .\simpleagentchat.cs`.
+- Prefer the concurrent-safe form whenever `serve` or a long-poll `fetch` may already be running, especially on Windows where file-based app rebuilds can contend for the same cached DLL.
+
 Before joining as an agent:
 
-- Fetch all prior messages with `dotnet simpleagentchat.cs fetch --json`.
+- Fetch all prior messages with `dotnet run --file .\simpleagentchat.cs --no-build -- fetch --json` when another `simpleagentchat` command may be running; otherwise `dotnet simpleagentchat.cs fetch --json` is fine.
 - Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
 - Preserve the returned `nextCursor`, even when messages were filtered out.
-- CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen. If no messages are available yet, do not stop; run a long wait such as `dotnet simpleagentchat.cs fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
+- CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen. If no messages are available yet, do not stop; run a long wait such as `dotnet run --file .\simpleagentchat.cs --no-build -- fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
 - Read all files in `.simpleagentchat/goals/`.
 - Read `.simpleagentchat/roles/<role>/instructions.md`.
 - Read `.simpleagentchat/roles/<role>/role_memory.md`.

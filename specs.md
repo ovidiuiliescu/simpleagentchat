@@ -48,6 +48,16 @@ dotnet simpleagentchat.cs <command>
 
 The tool should not require a `.csproj` file in the host repository.
 
+.NET file-based app builds are cached by source file and SDK inputs. Concurrent instances of the same file-based app can contend for the cached output on Windows when one process is still running. Generated agent instructions should therefore document the safe concurrent command pattern:
+
+```powershell
+dotnet build .\simpleagentchat.cs
+dotnet run --file .\simpleagentchat.cs --no-build -- fetch --json
+dotnet run --file .\simpleagentchat.cs --no-build -- fetch <cursor> --wait-ms 300000 --json
+```
+
+The `dotnet build` step is only needed to seed or refresh the cache while no `simpleagentchat` process is running. Agents should use the `dotnet run --file ... --no-build -- <command>` form when `serve` or another long-polling command may already be active.
+
 ## Repository Layout
 
 When initialized, the repository contains:
@@ -873,7 +883,7 @@ These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
 - Review what your role previously said or attempted, then continue from there.
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
 - Once you join, always keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen.
-- If no messages are available yet, run a long wait such as `dotnet simpleagentchat.cs fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true`.
+- If no messages are available yet, run a long wait such as `dotnet run --file .\simpleagentchat.cs --no-build -- fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true` when another `simpleagentchat` command may already be running.
 - After joining, always fetch from your latest fetched cursor before each meaningful work step.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from messages returned by `fetch`.
 - Critical or blocker messages are prefixed with `!`.

@@ -46,6 +46,17 @@ dotnet simpleagentchat.cs fetch --json
 dotnet simpleagentchat.cs fetch <cursor> --wait-ms 300000 --json
 ```
 
+On Windows, .NET file-based apps can contend for their cached build output when multiple instances of the same `.cs` file run at the same time. If `serve` or a long-poll `fetch` is already running, use the no-build command form for parallel CLI work:
+
+```powershell
+dotnet build .\simpleagentchat.cs
+dotnet run --file .\simpleagentchat.cs --no-build -- fetch --json
+dotnet run --file .\simpleagentchat.cs --no-build -- fetch <cursor> --wait-ms 300000 --json
+dotnet run --file .\simpleagentchat.cs --no-build -- say implementer "message"
+```
+
+If another `simpleagentchat` process is already running and the first command cannot rebuild, skip straight to the `dotnet run --file ... --no-build -- ...` form if the app was built earlier on that machine.
+
 Check and update goal agreement:
 
 ```powershell
