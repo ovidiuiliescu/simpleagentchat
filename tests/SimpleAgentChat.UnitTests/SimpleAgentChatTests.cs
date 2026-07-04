@@ -20,7 +20,8 @@ internal static class SimpleAgentChatTests
             ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
             ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
-            ("goal status store computes current role completion", TestGoalStatusStore)
+            ("goal status store computes current role completion", TestGoalStatusStore),
+            ("goal edit guidance resets approvals", TestGoalEditGuidanceResetsApprovals)
         };
 
         var failed = 0;
@@ -187,10 +188,16 @@ internal static class SimpleAgentChatTests
         Assert(block.Contains("agents run the already-built DLL", StringComparison.Ordinal), "already-built runner explanation missing");
         Assert(block.Contains("If your role-local runner is missing", StringComparison.Ordinal), "missing runner stop guidance missing");
         Assert(block.Contains("Do not repair `%TEMP%\\dotnet\\runfile` by hand", StringComparison.Ordinal), "runfile cache warning missing");
-        Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen", StringComparison.Ordinal), "join listening warning missing");
+        Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening", StringComparison.Ordinal), "join listening warning missing");
+        Assert(block.Contains("Do not stop just because all current goals are done; new goals can appear after completion", StringComparison.Ordinal), "goal-completion polling warning missing");
         Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "role runner long wait example missing");
         Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
-        Assert(block.Contains("until the goal is done or a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
+        Assert(block.Contains("until a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
+        Assert(block.Contains("Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added", StringComparison.Ordinal), "post-goal polling guidance missing");
+        Assert(!block.Contains("until the goal is done", StringComparison.Ordinal), "goal completion should not be a polling stop condition");
+        Assert(block.Contains("inform the chat when you complete a large or important chunk of work", StringComparison.Ordinal), "important progress update guidance missing");
+        Assert(block.Contains("Keep these progress updates concise and avoid spamming routine activity", StringComparison.Ordinal), "anti-spam progress guidance missing");
+        Assert(block.Contains("When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is", StringComparison.Ordinal), "handoff clarity guidance missing");
         Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");
         return Task.CompletedTask;
     }
@@ -318,6 +325,40 @@ internal static class SimpleAgentChatTests
             var reset = goals.GetStatus("release.md");
             Assert(!reset.Complete, "recheck resets completion");
             Assert(reset.Roles.All(role => role.Status == "undone"), "recheck marks all undone");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static async Task TestGoalEditGuidanceResetsApprovals()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            File.WriteAllText(workspace.GoalPath("release.md"), "# Release\n");
+            var goals = new GoalStatusStore(workspace);
+
+            await goals.MarkRoleStatusAsync("release.md", "implementer", "done", 0);
+            await goals.MarkRoleStatusAsync("release.md", "reviewer", "done", 0);
+            Assert(goals.GetStatus("release.md").Complete, "setup should complete the goal");
+
+            var editedMessage = MessageStore.NewMessage("system", "goals.changed", GoalSystemMessages.Edited("release.md"), Array.Empty<string>());
+            goals.ResetGoalForCurrentRoles("release.md", editedMessage.TimestampUtc, editedMessage.Id);
+            var reset = goals.GetStatus("release.md");
+
+            Assert(!reset.Complete, "editing a goal should reset completion");
+            Assert(reset.Roles.All(role => role.Status == "undone"), "editing a goal should mark every role undone");
+            Assert(reset.Roles.All(role => role.MessageId == editedMessage.Id), "reset statuses should point at the edit system message");
+            Assert(editedMessage.Markdown.Contains("All current roles were marked undone", StringComparison.Ordinal), "edit system message should explain status reset");
+            Assert(editedMessage.Markdown.Contains("reprocess the goal", StringComparison.Ordinal), "edit system message should tell agents to reprocess");
+            Assert(editedMessage.Markdown.Contains("re-approve it with `goal done`", StringComparison.Ordinal), "edit system message should tell agents to re-approve");
         }
         finally
         {

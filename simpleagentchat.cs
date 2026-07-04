@@ -1269,7 +1269,7 @@ Before joining as an agent:
 - Fetch all prior messages with your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json`.
 - Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
 - Preserve the returned `nextCursor`, even when messages were filtered out.
-- CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen. If no messages are available yet, do not stop; run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
+- CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion. If no messages are available yet, do not stop; run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
 - Read all files in `.simpleagentchat/goals/`.
 - Read `.simpleagentchat/roles/<role>/instructions.md`.
 - Read `.simpleagentchat/roles/<role>/role_memory.md`.
@@ -1279,11 +1279,13 @@ Before joining as an agent:
 During work:
 
 - Fetch from your latest fetched cursor before each meaningful step.
-- Keep a long-poll fetch active or repeat long waits from your latest fetched cursor until the goal is done or a fetched message explicitly tells you not to listen. A `timedOut: true` response means no message arrived during that wait, not that you may stop listening.
+- Keep a long-poll fetch active or repeat long waits from your latest fetched cursor until a fetched message explicitly tells you not to listen. A `timedOut: true` response means no message arrived during that wait, not that you may stop listening. Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from `fetch`.
+- To improve collaboration, inform the chat when you complete a large or important chunk of work, even if the whole goal is not done yet. Keep these progress updates concise and avoid spamming routine activity.
 - Obey critical messages that start with `!` immediately.
 - Obey newly fetched `system` messages immediately.
 - Re-read role instructions, role memory, and goals when instructed.
+- When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is.
 - Stop if your role directory no longer exists.
 - Put assets in `.simpleagentchat/assets/` before referencing them.
 
@@ -1555,6 +1557,12 @@ internal sealed class RoleStatusEntry
 internal sealed record GoalStatusReport(string Goal, bool Complete, IReadOnlyList<GoalRoleStatus> Roles);
 internal sealed record GoalRoleStatus(string Role, string Status, string? UpdatedAtUtc, string? MessageId);
 internal sealed record RecheckMessages(Message SystemMessage, Message GoalMessage);
+
+internal static class GoalSystemMessages
+{
+    public static string Edited(string goalName) =>
+        $"Goal `{goalName}` changed. All current roles were marked undone and must re-read `.simpleagentchat/goals/{goalName}`, reprocess the goal, and re-approve it with `goal done` after checking their role's responsibility.";
+}
 
 internal sealed class LocalServer
 {
@@ -2256,7 +2264,7 @@ internal sealed class LocalServer
         var message = MessageStore.NewMessage(
             "system",
             "goals.changed",
-            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            GoalSystemMessages.Edited(name),
             new[] { RootRelative(goalPath), RootRelative(statusPath) });
 
         await Retry.WithinAsync(30000, async () =>

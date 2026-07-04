@@ -367,9 +367,11 @@ It explains:
 - agents should use `goal undone <role> <goal_file_name>` if later changes invalidate their previous agreement
 - agents should use `goal recheck <goal_file_name> <reason>` when important changes require all roles to re-approve a goal
 - agents must track the `nextCursor` returned by `fetch`, not the cursor returned by their own `say`
-- agents must keep listening for new chat messages once they join until the goal is done or they are explicitly instructed not to listen
+- agents must keep listening for new chat messages once they join until a human or system message explicitly tells their role to stop listening; all current goals being done is not a stop condition because new goals can appear
 - agents must use a long wait, such as `fetch <nextCursor> --wait-ms 300000 --json`, when no messages are available yet, and repeat after `timedOut: true` instead of stopping
 - agents must fetch from their latest fetched cursor before each meaningful work step
+- agents should post concise progress updates when large or important chunks of work are completed, even if the whole goal is not done yet, while avoiding routine spam
+- agents must send a handoff message when their role finishes its part, saying what changed or what work was done and what their conclusion is
 - agents must obey critical `!` messages immediately
 - agents must obey newly fetched `system` messages immediately
 - agents must re-read role instructions, role memory, and goals when instructed
@@ -549,12 +551,12 @@ Agents should:
 1. Fetch initial context when joining.
 2. Expect historical `system` messages to be filtered out of that initial no-cursor fetch by default.
 3. Track the `nextCursor` returned by `fetch`.
-4. Keep listening from that cursor with long waits, for example `fetch <nextCursor> --wait-ms 300000 --json`, until the goal is done or a fetched message explicitly says not to listen.
+4. Keep listening from that cursor with long waits, for example `fetch <nextCursor> --wait-ms 300000 --json`, until a fetched message explicitly says not to listen.
 5. Fetch from that cursor before each meaningful work step.
 
 Agents must not advance their fetch cursor to the id returned by their own `say` command unless that message later appears in a `fetch` result. The fetch cursor means "the latest message I have fetched from the shared transcript", not "the latest message I personally sent".
 
-A successful fetch timeout is only evidence that no new message arrived during that wait. Agents that have joined must repeat the long wait instead of exiting, unless the goal is done or they were explicitly instructed not to listen.
+A successful fetch timeout is only evidence that no new message arrived during that wait. Agents that have joined must repeat the long wait instead of exiting. All current goals being complete is not a stop condition because new goals can appear; stop polling only when explicitly instructed not to listen.
 
 Even when messages are filtered from fetch output, the fetch response must include a next cursor or watermark representing the newest message observed in the underlying log. This prevents old filtered `system` messages from appearing as new messages on the next fetch.
 
@@ -889,9 +891,11 @@ These rules belong in `.simpleagentchat/HOW_TO_CHAT.md` and should be followed b
 - Read your assigned role instructions and role memory before speaking or working.
 - Review what your role previously said or attempted, then continue from there.
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
-- Once you join, always keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen.
+- Once you join, always keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion.
 - If no messages are available yet, run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true`.
 - After joining, always fetch from your latest fetched cursor before each meaningful work step.
+- To improve collaboration, inform the chat when you complete a large or important chunk of work, even if the whole goal is not done yet. Keep these progress updates concise and avoid spamming routine activity.
+- When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from messages returned by `fetch`.
 - Critical or blocker messages are prefixed with `!`.
 - Always obey critical `!` messages immediately.
@@ -990,7 +994,7 @@ Endpoint contracts:
 - `GET /api/goals` returns safe goal file names, metadata, a `complete` flag, and a `status` object containing the current per-role goal status report.
 - `POST /api/goals` accepts `{ "name": "...", "content": "..." }`, creates a new goal, rejects existing goals, resets completion status for all current roles, and emits a `goals.changed` system message.
 - `GET /api/goals/<name>` returns `{ "name": "...", "content": "...", "status": ... }`, where `status` contains the same current per-role goal status report used by `goal status --json`.
-- `PUT /api/goals/<name>` accepts `{ "content": "..." }`, writes the goal file, resets completion status for that goal to `undone` for all current roles, and emits a `goals.changed` system message.
+- `PUT /api/goals/<name>` accepts `{ "content": "..." }`, writes the goal file, resets completion status for that goal to `undone` for all current roles, and emits a `goals.changed` system message that tells agents the goal changed, all current roles were marked undone, and the goal must be reprocessed and re-approved.
 - `POST /api/goals/<name>/rename` accepts `{ "name": "new-name.md" }`, renames the current goal, rejects existing target goals, preserves the goal content and status metadata, and emits a `goals.changed` system message.
 - `DELETE /api/goals/<name>` deletes the goal file, deletes the goal status file if present, and emits a `goals.changed` system message.
 - `GET /api/assets` returns safe asset file names and metadata.
