@@ -12,6 +12,7 @@ internal static class SimpleAgentChatTests
             ("say parser keeps inline markdown literal after first token", TestSayParser),
             ("fetch parser enforces cursor and wait rules", TestFetchParser),
             ("goal parser handles status, mark, and recheck forms", TestGoalParser),
+            ("serve parser handles port and browser options", TestServeParser),
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
             ("goal status store computes current role completion", TestGoalStatusStore)
         };
@@ -98,6 +99,16 @@ internal static class SimpleAgentChatTests
         AssertEqual("recheck", recheck.Action, "recheck action");
         AssertEqual("--reason text", recheck.Reason, "recheck reason");
         AssertEqual(7, recheck.WaitMs, "recheck wait");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestServeParser()
+    {
+        var parsed = ServeArgs.Parse(new[] { "--port", "8766", "--no-open" });
+        AssertEqual(8766, parsed.Port, "port");
+        Assert(parsed.NoOpen, "no open");
+        AssertThrows<CliException>(() => ServeArgs.Parse(new[] { "--port", "0" }), "port 0 should fail");
+        AssertThrows<CliException>(() => ServeArgs.Parse(new[] { "--bogus" }), "unknown serve option should fail");
         return Task.CompletedTask;
     }
 

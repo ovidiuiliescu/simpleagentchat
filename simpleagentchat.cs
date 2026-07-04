@@ -165,7 +165,11 @@ internal static class Commands
 
     public static async Task<int> ServeAsync(string[] args)
     {
-        throw new CliException(3, "not_implemented", "The serve command is implemented in a later slice.");
+        var parsed = ServeArgs.Parse(args);
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.Initialize(root);
+        var server = new LocalServer(workspace, parsed.Port, parsed.NoOpen);
+        return await server.RunAsync();
     }
 }
 
@@ -544,6 +548,46 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
         }
 
         return new GoalArgs("recheck", null, goal, waitMs, false, reason);
+    }
+}
+
+internal sealed record ServeArgs(int? Port, bool NoOpen)
+{
+    public static ServeArgs Parse(string[] args)
+    {
+        int? port = null;
+        var noOpen = false;
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token == "--no-open")
+            {
+                noOpen = true;
+                continue;
+            }
+
+            if (token == "--port")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw CliException.Usage("usage", "--port requires a value.");
+                }
+
+                if (!int.TryParse(args[++i], NumberStyles.None, CultureInfo.InvariantCulture, out var parsedPort) ||
+                    parsedPort < 1 ||
+                    parsedPort > 65535)
+                {
+                    throw CliException.Validation("invalid_port", "Port must be an integer from 1 through 65535.");
+                }
+
+                port = parsedPort;
+                continue;
+            }
+
+            throw CliException.Usage("usage", $"Unknown option '{token}'.");
+        }
+
+        return new ServeArgs(port, noOpen);
     }
 }
 
@@ -1337,6 +1381,727 @@ internal sealed record GoalStatusReport(string Goal, bool Complete, IReadOnlyLis
 internal sealed record GoalRoleStatus(string Role, string Status, string? UpdatedAtUtc, string? MessageId);
 internal sealed record RecheckMessages(Message SystemMessage, Message GoalMessage);
 
+internal sealed class LocalServer
+{
+    private const int DefaultStartPort = 8765;
+    private const int DefaultEndPort = 8799;
+    private const long MaxAssetBytes = 25L * 1024L * 1024L;
+    private readonly ChatWorkspace _workspace;
+    private readonly int? _requestedPort;
+    private readonly bool _noOpen;
+    private int _port;
+
+    public LocalServer(ChatWorkspace workspace, int? requestedPort, bool noOpen)
+    {
+        _workspace = workspace;
+        _requestedPort = requestedPort;
+        _noOpen = noOpen;
+    }
+
+    public async Task<int> RunAsync()
+    {
+        using var listener = StartListener();
+        var url = $"http://127.0.0.1:{_port}/";
+        if (_noOpen)
+        {
+            Console.Out.WriteLine(url);
+        }
+        else
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            }
+            catch
+            {
+                Console.Out.WriteLine(url);
+            }
+        }
+
+        using var cancellation = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+            listener.Stop();
+        };
+
+        while (!cancellation.IsCancellationRequested)
+        {
+            HttpListenerContext context;
+            try
+            {
+                context = await listener.GetContextAsync();
+            }
+            catch (HttpListenerException) when (cancellation.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+
+            _ = Task.Run(() => HandleContextAsync(context), cancellation.Token);
+        }
+
+        return 0;
+    }
+
+    private HttpListener StartListener()
+    {
+        if (_requestedPort.HasValue)
+        {
+            return TryStart(_requestedPort.Value) ??
+                   throw CliException.ServerStartup($"Port {_requestedPort.Value} is unavailable.");
+        }
+
+        for (var port = DefaultStartPort; port <= DefaultEndPort; port++)
+        {
+            var listener = TryStart(port);
+            if (listener is not null)
+            {
+                return listener;
+            }
+        }
+
+        throw CliException.ServerStartup($"No loopback port from {DefaultStartPort} through {DefaultEndPort} is available.");
+    }
+
+    private HttpListener? TryStart(int port)
+    {
+        try
+        {
+            var listener = new HttpListener();
+            listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+            listener.Start();
+            _port = port;
+            return listener;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task HandleContextAsync(HttpListenerContext context)
+    {
+        try
+        {
+            context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+            await RouteAsync(context);
+        }
+        catch (ApiException ex)
+        {
+            await WriteJsonAsync(context, ex.StatusCode, new { error = new { code = ex.Code, message = ex.Message } });
+        }
+        catch (CliException ex)
+        {
+            await WriteJsonAsync(context, 400, new { error = new { code = ex.Code, message = ex.Message } });
+        }
+        catch (Exception ex)
+        {
+            await WriteJsonAsync(context, 500, new { error = new { code = "server_error", message = ex.Message } });
+        }
+        finally
+        {
+            context.Response.Close();
+        }
+    }
+
+    private async Task RouteAsync(HttpListenerContext context)
+    {
+        var method = context.Request.HttpMethod.ToUpperInvariant();
+        var segments = GetSegments(context.Request);
+
+        if (segments.Length == 0 && method == "GET")
+        {
+            await SendFileAsync(context, _workspace.UiHtmlPath, "text/html; charset=utf-8", attachment: false);
+            return;
+        }
+
+        if (segments is ["chat.html"] && method == "GET")
+        {
+            HtmlViews.RegenerateChat(_workspace);
+            await SendFileAsync(context, _workspace.ChatHtmlPath, "text/html; charset=utf-8", attachment: false);
+            return;
+        }
+
+        if (segments.Length >= 1 && segments[0] == "assets")
+        {
+            await RouteAssetFileAsync(context, method, segments);
+            return;
+        }
+
+        if (segments.Length >= 1 && segments[0] == "api")
+        {
+            await RouteApiAsync(context, method, segments);
+            return;
+        }
+
+        throw new ApiException(404, "not_found", "Endpoint not found.");
+    }
+
+    private async Task RouteApiAsync(HttpListenerContext context, string method, string[] segments)
+    {
+        if (segments.Length == 2 && segments[1] == "messages")
+        {
+            if (method == "GET")
+            {
+                await GetMessagesAsync(context);
+                return;
+            }
+
+            if (method == "POST")
+            {
+                await PostMessageAsync(context);
+                return;
+            }
+        }
+
+        if (segments.Length >= 2 && segments[1] == "roles")
+        {
+            await RouteRolesAsync(context, method, segments);
+            return;
+        }
+
+        if (segments.Length >= 2 && segments[1] == "goals")
+        {
+            await RouteGoalsAsync(context, method, segments);
+            return;
+        }
+
+        if (segments.Length >= 2 && segments[1] == "assets")
+        {
+            await RouteAssetsApiAsync(context, method, segments);
+            return;
+        }
+
+        throw new ApiException(404, "not_found", "API endpoint not found.");
+    }
+
+    private async Task GetMessagesAsync(HttpListenerContext context)
+    {
+        var query = context.Request.QueryString;
+        var cursor = EmptyToNull(query["cursor"]);
+        if (cursor is not null && !NameRules.IsValidMessageId(cursor))
+        {
+            throw CliException.Validation("invalid_cursor", "Cursor is not a valid simpleagentchat message id.");
+        }
+
+        var waitMs = string.IsNullOrWhiteSpace(query["waitMs"]) ? 0 : CliParsing.ParseWaitMs(query["waitMs"]!);
+        var includeSystem = string.IsNullOrWhiteSpace(query["includeSystem"])
+            ? true
+            : ParseBool(query["includeSystem"]!, "includeSystem");
+        var response = await new MessageStore(_workspace).FetchAsync(cursor, includeSystem, waitMs);
+        await WriteJsonAsync(context, 200, response);
+    }
+
+    private async Task PostMessageAsync(HttpListenerContext context)
+    {
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var markdown = GetString(document, "markdown") ?? "";
+        var critical = GetBool(document, "critical") ?? false;
+        if (critical && !markdown.TrimStart().StartsWith("!", StringComparison.Ordinal))
+        {
+            markdown = "! " + markdown.TrimStart();
+        }
+
+        var message = await new MessageStore(_workspace).AppendAsync("human", "chat.message", markdown, Array.Empty<string>(), 30000);
+        await WriteJsonAsync(context, 200, new { message, nextCursor = message.Id });
+    }
+
+    private async Task RouteRolesAsync(HttpListenerContext context, string method, string[] segments)
+    {
+        if (segments.Length == 2 && method == "GET")
+        {
+            var roles = _workspace.GetRoleNames().Select(role =>
+            {
+                var dir = _workspace.RoleDirectory(role);
+                var instructions = new FileInfo(Path.Combine(dir, "instructions.md"));
+                var memory = new FileInfo(Path.Combine(dir, "role_memory.md"));
+                return new
+                {
+                    role,
+                    instructionsLength = instructions.Exists ? instructions.Length : 0,
+                    memoryLength = memory.Exists ? memory.Length : 0,
+                    updatedAtUtc = LatestWriteUtc(instructions, memory)
+                };
+            }).ToArray();
+            await WriteJsonAsync(context, 200, new { roles });
+            return;
+        }
+
+        if (segments.Length == 3 && method == "GET")
+        {
+            await WriteJsonAsync(context, 200, ReadRole(segments[2]));
+            return;
+        }
+
+        if (segments.Length == 3 && method == "DELETE")
+        {
+            await DeleteRoleAsync(context, segments[2]);
+            return;
+        }
+
+        if (segments.Length == 4 && method == "PUT" && segments[3] == "instructions")
+        {
+            await PutRoleInstructionsAsync(context, segments[2]);
+            return;
+        }
+
+        if (segments.Length == 4 && method == "PUT" && segments[3] == "memory")
+        {
+            await PutRoleMemoryAsync(context, segments[2]);
+            return;
+        }
+
+        throw new ApiException(404, "not_found", "Role endpoint not found.");
+    }
+
+    private object ReadRole(string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = _workspace.RoleDirectory(role);
+        if (!Directory.Exists(dir))
+        {
+            throw new ApiException(404, "missing_role", $"Role '{role}' does not exist.");
+        }
+
+        return new
+        {
+            role,
+            instructions = File.ReadAllText(Path.Combine(dir, "instructions.md"), Encoding.UTF8),
+            memory = File.ReadAllText(Path.Combine(dir, "role_memory.md"), Encoding.UTF8)
+        };
+    }
+
+    private async Task PutRoleInstructionsAsync(HttpListenerContext context, string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var markdown = GetString(document, "markdown") ?? "";
+        _workspace.EnsureRoleFiles(role);
+        var path = Path.Combine(_workspace.RoleDirectory(role), "instructions.md");
+        Atomic.WriteText(path, markdown);
+        var changedPath = RootRelative(path);
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "roles.changed",
+            "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
+            new[] { changedPath },
+            30000);
+        await WriteJsonAsync(context, 200, new { role, message });
+    }
+
+    private async Task PutRoleMemoryAsync(HttpListenerContext context, string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var markdown = GetString(document, "markdown") ?? "";
+        _workspace.EnsureRoleFiles(role);
+        var path = Path.Combine(_workspace.RoleDirectory(role), "role_memory.md");
+        Atomic.WriteText(path, markdown);
+        var changedPath = RootRelative(path);
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "roles.memory.changed",
+            "Role memory changed. Agents using that role must re-read role memory before continuing.",
+            new[] { changedPath },
+            30000);
+        await WriteJsonAsync(context, 200, new { role, message });
+    }
+
+    private async Task DeleteRoleAsync(HttpListenerContext context, string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = _workspace.RoleDirectory(role);
+        if (!Directory.Exists(dir))
+        {
+            throw new ApiException(404, "missing_role", $"Role '{role}' does not exist.");
+        }
+
+        Directory.Delete(dir, recursive: true);
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "roles.deleted",
+            $"! Role \"{role}\" was deleted. Any agent using that role must stop immediately.",
+            new[] { RootRelative(dir) },
+            30000);
+        await WriteJsonAsync(context, 200, new { role, deleted = true, message });
+    }
+
+    private async Task RouteGoalsAsync(HttpListenerContext context, string method, string[] segments)
+    {
+        if (segments.Length == 2 && method == "GET")
+        {
+            var statusStore = new GoalStatusStore(_workspace);
+            var goals = _workspace.GetGoalNames().Select(name =>
+            {
+                var file = new FileInfo(_workspace.GoalPath(name));
+                var status = statusStore.GetStatus(name);
+                return new
+                {
+                    name,
+                    length = file.Exists ? file.Length : 0,
+                    updatedAtUtc = file.Exists ? Time.RoundTrip(file.LastWriteTimeUtc) : null,
+                    complete = status.Complete
+                };
+            }).ToArray();
+            await WriteJsonAsync(context, 200, new { goals });
+            return;
+        }
+
+        if (segments.Length == 3 && method == "GET")
+        {
+            await WriteJsonAsync(context, 200, ReadGoal(segments[2]));
+            return;
+        }
+
+        if (segments.Length == 3 && method == "PUT")
+        {
+            await PutGoalAsync(context, segments[2]);
+            return;
+        }
+
+        if (segments.Length == 3 && method == "DELETE")
+        {
+            await DeleteGoalAsync(context, segments[2]);
+            return;
+        }
+
+        throw new ApiException(404, "not_found", "Goal endpoint not found.");
+    }
+
+    private object ReadGoal(string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        var path = _workspace.GoalPath(name);
+        if (!File.Exists(path))
+        {
+            throw new ApiException(404, "missing_goal", $"Goal '{name}' does not exist.");
+        }
+
+        return new { name, content = File.ReadAllText(path, Encoding.UTF8) };
+    }
+
+    private async Task PutGoalAsync(HttpListenerContext context, string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var content = GetString(document, "content") ?? "";
+        var goalPath = _workspace.GoalPath(name);
+        var statusPath = _workspace.GoalStatusPath(name);
+        var store = new MessageStore(_workspace);
+        var message = store.NewMessage(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(goalPath), RootRelative(statusPath) });
+
+        await Retry.WithinAsync(30000, async () =>
+        {
+            Atomic.WriteText(goalPath, content);
+            new GoalStatusStore(_workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
+            await store.WriteMessageFileNoRetryAsync(message);
+            HtmlViews.RegenerateChat(_workspace);
+        });
+
+        await WriteJsonAsync(context, 200, new { name, message });
+    }
+
+    private async Task DeleteGoalAsync(HttpListenerContext context, string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        var goalPath = _workspace.GoalPath(name);
+        if (!File.Exists(goalPath))
+        {
+            throw new ApiException(404, "missing_goal", $"Goal '{name}' does not exist.");
+        }
+
+        var statusPath = _workspace.GoalStatusPath(name);
+        File.Delete(goalPath);
+        if (File.Exists(statusPath))
+        {
+            File.Delete(statusPath);
+        }
+
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(goalPath), RootRelative(statusPath) },
+            30000);
+        await WriteJsonAsync(context, 200, new { name, deleted = true, message });
+    }
+
+    private async Task RouteAssetsApiAsync(HttpListenerContext context, string method, string[] segments)
+    {
+        if (segments.Length == 2 && method == "GET")
+        {
+            var assets = _workspace.GetAssetNames().Select(name =>
+            {
+                var file = new FileInfo(_workspace.AssetPath(name));
+                return new
+                {
+                    name,
+                    length = file.Exists ? file.Length : 0,
+                    updatedAtUtc = file.Exists ? Time.RoundTrip(file.LastWriteTimeUtc) : null
+                };
+            }).ToArray();
+            await WriteJsonAsync(context, 200, new { assets });
+            return;
+        }
+
+        if (segments.Length == 3 && method == "PUT")
+        {
+            await PutAssetAsync(context, segments[2]);
+            return;
+        }
+
+        throw new ApiException(404, "not_found", "Asset endpoint not found.");
+    }
+
+    private async Task PutAssetAsync(HttpListenerContext context, string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
+        }
+
+        if (context.Request.ContentLength64 > MaxAssetBytes)
+        {
+            throw new ApiException(413, "asset_too_large", "Asset upload exceeds the 25 MiB limit.");
+        }
+
+        var path = _workspace.AssetPath(name);
+        var tempPath = Path.Combine(_workspace.AssetsDir, "." + name + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        long total = 0;
+        Directory.CreateDirectory(_workspace.AssetsDir);
+        try
+        {
+            await using var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
+            {
+                while (true)
+                {
+                    var read = await context.Request.InputStream.ReadAsync(buffer.AsMemory(0, buffer.Length));
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    total += read;
+                    if (total > MaxAssetBytes)
+                    {
+                        throw new ApiException(413, "asset_too_large", "Asset upload exceeds the 25 MiB limit.");
+                    }
+
+                    await output.WriteAsync(buffer.AsMemory(0, read));
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+        catch
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+
+            throw;
+        }
+
+        File.Move(tempPath, path, overwrite: true);
+        await WriteJsonAsync(context, 200, new { name, length = total });
+    }
+
+    private async Task RouteAssetFileAsync(HttpListenerContext context, string method, string[] segments)
+    {
+        if (segments.Length != 2 || method != "GET")
+        {
+            throw new ApiException(404, "not_found", "Asset endpoint not found.");
+        }
+
+        var name = segments[1];
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
+        }
+
+        var path = _workspace.AssetPath(name);
+        if (!File.Exists(path))
+        {
+            throw new ApiException(404, "missing_asset", $"Asset '{name}' does not exist.");
+        }
+
+        var (contentType, attachment) = AssetContentType(name);
+        await SendFileAsync(context, path, contentType, attachment);
+    }
+
+    private static string[] GetSegments(HttpListenerRequest request)
+    {
+        var absolutePath = request.Url?.AbsolutePath ?? "/";
+        if (absolutePath.Contains("%2f", StringComparison.OrdinalIgnoreCase) ||
+            absolutePath.Contains("%5c", StringComparison.OrdinalIgnoreCase))
+        {
+            throw CliException.Validation("unsafe_path", "Encoded path separators are not allowed.");
+        }
+
+        return absolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(segment => Uri.UnescapeDataString(segment))
+            .ToArray();
+    }
+
+    private static async Task<JsonDocument> ReadJsonDocumentAsync(HttpListenerRequest request)
+    {
+        using var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8);
+        var body = await reader.ReadToEndAsync();
+        try
+        {
+            return JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+        }
+        catch (JsonException ex)
+        {
+            throw CliException.Validation("invalid_json", ex.Message);
+        }
+    }
+
+    private static string? GetString(JsonDocument document, string propertyName)
+    {
+        return document.RootElement.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private static bool? GetBool(JsonDocument document, string propertyName)
+    {
+        return document.RootElement.TryGetProperty(propertyName, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? value.GetBoolean()
+            : null;
+    }
+
+    private static bool ParseBool(string value, string name)
+    {
+        if (bool.TryParse(value, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw CliException.Validation("invalid_bool", $"{name} must be true or false.");
+    }
+
+    private static string? EmptyToNull(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    private static async Task WriteJsonAsync(HttpListenerContext context, int statusCode, object body)
+    {
+        await WriteBytesAsync(context, statusCode, "application/json; charset=utf-8", Encoding.UTF8.GetBytes(Json.Text(body) + "\n"));
+    }
+
+    private static async Task SendFileAsync(HttpListenerContext context, string path, string contentType, bool attachment)
+    {
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = contentType;
+        context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+        if (attachment)
+        {
+            context.Response.Headers["Content-Disposition"] = "attachment; filename=\"" + Path.GetFileName(path).Replace("\"", "", StringComparison.Ordinal) + "\"";
+        }
+
+        var info = new FileInfo(path);
+        context.Response.ContentLength64 = info.Length;
+        await using var input = File.OpenRead(path);
+        await input.CopyToAsync(context.Response.OutputStream);
+    }
+
+    private static async Task WriteBytesAsync(HttpListenerContext context, int statusCode, string contentType, byte[] bytes)
+    {
+        context.Response.StatusCode = statusCode;
+        context.Response.ContentType = contentType;
+        context.Response.ContentLength64 = bytes.Length;
+        context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+        await context.Response.OutputStream.WriteAsync(bytes);
+    }
+
+    private static (string ContentType, bool Attachment) AssetContentType(string name)
+    {
+        var extension = Path.GetExtension(name).ToLowerInvariant();
+        return extension switch
+        {
+            ".txt" => ("text/plain; charset=utf-8", false),
+            ".md" => ("text/markdown; charset=utf-8", false),
+            ".png" => ("image/png", false),
+            ".jpg" or ".jpeg" => ("image/jpeg", false),
+            ".gif" => ("image/gif", false),
+            ".webp" => ("image/webp", false),
+            ".pdf" => ("application/pdf", false),
+            ".html" or ".htm" or ".svg" or ".xml" or ".js" or ".mjs" or ".css" => ("application/octet-stream", true),
+            _ => ("application/octet-stream", false)
+        };
+    }
+
+    private static string? LatestWriteUtc(params FileInfo[] files)
+    {
+        var existing = files.Where(file => file.Exists).ToArray();
+        if (existing.Length == 0)
+        {
+            return null;
+        }
+
+        return Time.RoundTrip(existing.Max(file => file.LastWriteTimeUtc));
+    }
+
+    private string RootRelative(string fullPath)
+    {
+        return Path.GetRelativePath(_workspace.Root, fullPath).Replace('\\', '/');
+    }
+}
+
+internal sealed class ApiException : Exception
+{
+    public int StatusCode { get; }
+    public string Code { get; }
+
+    public ApiException(int statusCode, string code, string message)
+        : base(message)
+    {
+        StatusCode = statusCode;
+        Code = code;
+    }
+}
+
 internal sealed class MessageStore
 {
     private readonly ChatWorkspace _workspace;
@@ -1665,7 +2430,7 @@ async function sendMessage(){await api('/api/messages',{method:'POST',headers:{'
 function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
 async function loadRoles(){const data=await api('/api/roles'); $('roleSelect').innerHTML=data.roles.map(r=>`<option>${r.role}</option>`).join(''); if(data.roles.length) await loadRole()}
 async function loadRole(){const role=$('roleSelect').value; if(!role)return; const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory}
-async function saveRole(){await saveRoleInstructions(); await saveRoleMemory(); await refreshAll()}
+async function saveRole(){const role=$('roleName').value || $('roleSelect').value; const instructions=$('roleInstructions').value; const memory=$('roleMemory').value; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:instructions})}); await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:memory})}); await refreshAll()}
 async function saveRoleInstructions(){const role=$('roleName').value || $('roleSelect').value; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles()}
 async function saveRoleMemory(){const role=$('roleName').value || $('roleSelect').value; await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleMemory').value})}); await loadRoles()}
 async function deleteRole(){const role=$('roleSelect').value; if(role){await api('/api/roles/'+encodeURIComponent(role),{method:'DELETE'}); await refreshAll()}}
