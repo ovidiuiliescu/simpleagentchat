@@ -24,6 +24,7 @@ dotnet simpleagentchat.cs goal status <goal_file_name>
 dotnet simpleagentchat.cs goal done <role> <goal_file_name>
 dotnet simpleagentchat.cs goal undone <role> <goal_file_name>
 dotnet simpleagentchat.cs goal recheck <goal_file_name> <reason>
+dotnet simpleagentchat.cs export-html
 ```
 
 ## Design Principles
@@ -65,7 +66,6 @@ When initialized, the repository contains:
       instructions.md
       role_memory.md
   state.json
-  chat.html
   ui.html
 HOW_TO_CHAT.md
 AGENTS.md
@@ -203,7 +203,7 @@ Message ids must match:
 \d{8}T\d{6}\.\d{7}Z-[a-z][a-z0-9_-]{0,63}-[a-f0-9]{6,16}
 ```
 
-The generated HTML files are views over these message files. If `chat.html` is deleted or stale, it can be regenerated from `messages/`.
+Exported or served HTML transcript views are derived from these message files. If `chat.html` is needed, it can be generated explicitly from `messages/`.
 
 ### `.simpleagentchat/roles/`
 
@@ -299,7 +299,7 @@ The canonical chat history remains the message files.
 
 ### `.simpleagentchat/chat.html`
 
-This is the generated chat transcript. It renders Markdown messages as HTML with timestamps, roles, message ids, and styling.
+This is an exported chat transcript generated only when the human or an agent explicitly runs the HTML export command. It renders Markdown messages as HTML with timestamps, roles, message ids, and styling.
 
 This file should be safe to open directly from disk for read-only viewing. It may use a lightweight timed refresh when opened as a `file://` document, but browser security means it cannot write chat messages or call the CLI by itself.
 
@@ -307,7 +307,7 @@ This file should be safe to open directly from disk for read-only viewing. It ma
 
 This is the local-server UI shell used by `serve`. It must include:
 
-- chat transcript
+- live chat transcript rendered from the local server message API
 - human message prompt
 - role editor
 - role memory/thoughts editor
@@ -396,7 +396,7 @@ It should:
 5. Ensure `.simpleagentchat/` is ignored by git.
 6. Ensure `HOW_TO_CHAT.md` exists.
 7. Ensure `AGENTS.md` contains the simpleagentchat instruction block.
-8. Regenerate `chat.html`.
+8. Write or refresh `ui.html`.
 9. Start a tiny localhost server.
 10. Open the UI in a browser or print the URL.
 
@@ -434,9 +434,9 @@ dotnet simpleagentchat.cs say <role> [--wait-ms <ms>] --file <path>
 
 Adds a new public chat message.
 
-The message content is assumed to be Markdown. The original Markdown is stored in the message JSON file. HTML rendering happens when `chat.html` is regenerated.
+The message content is assumed to be Markdown. The original Markdown is stored in the message JSON file. Safe HTML rendering happens on demand for the server UI, `/chat.html`, and `export-html`.
 
-`--wait-ms` controls how long the command retries when message files or generated files are temporarily locked. It defaults to `30000`. A value of `0` means try once and return immediately on lock failure.
+`--wait-ms` controls how long the command retries when message files are temporarily locked. It defaults to `30000`. A value of `0` means try once and return immediately on lock failure.
 
 On success, the command prints only the new message cursor/id to stdout and exits with code `0`.
 
@@ -590,6 +590,16 @@ When a command fails, JSON mode should return a JSON error object on stderr:
 }
 ```
 
+### `export-html`
+
+```powershell
+dotnet simpleagentchat.cs export-html
+```
+
+Generates `.simpleagentchat/chat.html` from the canonical message files, prints the generated file path, and exits with code `0`.
+
+This command is for read-only sharing or offline inspection. Normal `serve`, `say`, `goal`, and UI workflows should not regenerate `chat.html`; the live browser UI should render messages through the local server message API instead.
+
 ### `goal`
 
 ```powershell
@@ -608,9 +618,9 @@ Validation:
 - `goal` is a reserved role name and cannot be used as an agent role.
 - `reason` for `goal recheck` must be non-empty after trimming whitespace.
 
-`goal done <role> <goal_file_name>` marks that role's status for the goal as `done`, writes the updated status file, appends a public message from `<role>` with kind `goals.done`, regenerates `chat.html`, prints the new message cursor/id to stdout, and exits with code `0`.
+`goal done <role> <goal_file_name>` marks that role's status for the goal as `done`, writes the updated status file, appends a public message from `<role>` with kind `goals.done`, prints the new message cursor/id to stdout, and exits with code `0`.
 
-`goal undone <role> <goal_file_name>` marks that role's status for the goal as `undone`, writes the updated status file, appends a public message from `<role>` with kind `goals.undone`, regenerates `chat.html`, prints the new message cursor/id to stdout, and exits with code `0`.
+`goal undone <role> <goal_file_name>` marks that role's status for the goal as `undone`, writes the updated status file, appends a public message from `<role>` with kind `goals.undone`, prints the new message cursor/id to stdout, and exits with code `0`.
 
 `goal status <goal_file_name>` reports the current status for every current valid role. Roles with no explicit entry are reported as `undone`. The goal is complete only when every current valid role is `done`.
 
@@ -655,8 +665,7 @@ With `--json`, status output should use this shape:
 2. Write the updated status file.
 3. Append a `system` message with kind `goals.recheck` explaining that all roles must re-check and re-approve the goal.
 4. Append a regular public chat message from the reserved `goal` role with kind `chat.message` and the supplied reason.
-5. Regenerate `chat.html`.
-6. Print both created message cursor ids to stdout in a stable form.
+5. Print both created message cursor ids to stdout in a stable form.
 
 Example `goal recheck` stdout:
 
@@ -710,7 +719,7 @@ Message ids are cursors. They must be sortable in chronological order and unique
 
 ## Markdown Rendering
 
-Messages are authored as Markdown and rendered to HTML for `chat.html` and the server UI.
+Messages are authored as Markdown and rendered to safe HTML for the live server UI, the on-demand `/chat.html` view, and exported `chat.html` transcripts.
 
 The renderer should escape unsafe HTML by default. Raw HTML in Markdown should either be disabled or treated as a trusted explicit mode.
 
@@ -872,13 +881,12 @@ Required approach:
 - Write each message to a temporary file first.
 - Flush and close the file.
 - Atomically move it into `.simpleagentchat/messages/`.
-- Regenerate `chat.html` after successful message creation.
 - Use retry loops for temporary file locks.
 - Avoid editing existing message files.
 - Sort messages by cursor/id when reading.
 - Write goal status files through temporary files and atomic replacement.
 
-The generated `chat.html` should also be written through a temporary file and atomically replaced.
+The explicit `export-html` command should write `chat.html` through a temporary file and atomically replace the prior export.
 
 ## Local Server
 
@@ -888,10 +896,10 @@ It must:
 
 - bind to loopback only, either `127.0.0.1` or `localhost`
 - avoid external network dependencies
-- serve the UI and generated chat view
+- serve the UI, a live message API, and an on-demand read-only chat view
 - write all messages through the same message creation path as `say`
 - generate `system` messages for human/UI role and goal changes
-- regenerate `chat.html` after message or configuration changes
+- notify browser clients when message, role, goal, or asset files change
 - reject any request that resolves outside the allowed `.simpleagentchat/` subdirectory
 
 Port behavior:
@@ -912,39 +920,51 @@ Required endpoints:
 GET  /
 GET  /chat.html
 GET  /api/messages?cursor=<cursor>&waitMs=<ms>&includeSystem=<bool>
+GET  /api/events
 POST /api/messages
 GET  /api/roles
+POST /api/roles
 GET  /api/roles/<role>
 PUT  /api/roles/<role>/instructions
 PUT  /api/roles/<role>/memory
+POST /api/roles/<role>/rename
 DELETE /api/roles/<role>
 GET  /api/goals
+POST /api/goals
 GET  /api/goals/<name>
 PUT  /api/goals/<name>
+POST /api/goals/<name>/rename
 DELETE /api/goals/<name>
 GET  /api/assets
 GET  /assets/<name>
 PUT  /api/assets/<name>
+DELETE /api/assets/<name>
 ```
 
 Endpoint contracts:
 
 - `GET /` serves `ui.html`.
-- `GET /chat.html` serves the generated transcript.
-- `GET /api/messages` returns the same JSON schema as `fetch --json`. For UI use and cursor-based polling, `includeSystem` should default to `true`; for no-cursor agent CLI fetches it defaults to `false`.
+- `GET /chat.html` serves an on-demand read-only transcript without writing `.simpleagentchat/chat.html`.
+- `GET /api/messages` returns the same core JSON schema as `fetch --json`, with an additional `html` field on each message for safe browser rendering. For UI use and cursor-based polling, `includeSystem` should default to `true`; for no-cursor agent CLI fetches it defaults to `false`.
+- `GET /api/events` returns a Server-Sent Events stream that notifies browser clients when messages, roles, goals, or assets change. The server should watch the chat files so messages written by agent CLI commands refresh the browser UI without manual polling.
 - `POST /api/messages` accepts `{ "markdown": "...", "critical": false }`, writes a `human` message, and returns the created message object plus `nextCursor`. If `critical` is `true` and the trimmed Markdown does not start with `!`, the server prepends `! ` before writing the message.
 - `GET /api/roles` returns role names and metadata for valid role directories.
+- `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, rejects existing roles, and emits a `roles.changed` system message.
 - `GET /api/roles/<role>` returns `{ "role": "...", "instructions": "...", "memory": "..." }`.
 - `PUT /api/roles/<role>/instructions` accepts `{ "markdown": "..." }`, creates the role directory and default `role_memory.md` if the role does not already exist, writes `instructions.md`, and emits a `roles.changed` system message.
 - `PUT /api/roles/<role>/memory` accepts `{ "markdown": "..." }`, writes `role_memory.md`, and emits a `roles.memory.changed` system message because the edit came through the human/UI channel.
+- `POST /api/roles/<role>/rename` accepts `{ "role": "new-role" }`, renames the current role, rejects existing target roles, preserves instructions and memory, updates goal status metadata for the renamed role, and emits a `roles.changed` system message.
 - `DELETE /api/roles/<role>` deletes that role directory and emits a critical `roles.deleted` system message whose Markdown starts with `!`.
 - `GET /api/goals` returns safe goal file names and metadata.
+- `POST /api/goals` accepts `{ "name": "...", "content": "..." }`, creates a new goal, rejects existing goals, resets completion status for all current roles, and emits a `goals.changed` system message.
 - `GET /api/goals/<name>` returns `{ "name": "...", "content": "..." }`.
 - `PUT /api/goals/<name>` accepts `{ "content": "..." }`, writes the goal file, resets completion status for that goal to `undone` for all current roles, and emits a `goals.changed` system message.
+- `POST /api/goals/<name>/rename` accepts `{ "name": "new-name.md" }`, renames the current goal, rejects existing target goals, preserves the goal content and status metadata, and emits a `goals.changed` system message.
 - `DELETE /api/goals/<name>` deletes the goal file, deletes the goal status file if present, and emits a `goals.changed` system message.
 - `GET /api/assets` returns safe asset file names and metadata.
 - `GET /assets/<name>` serves only a safe file from `.simpleagentchat/assets/`.
 - `PUT /api/assets/<name>` writes raw request bytes to `.simpleagentchat/assets/<name>`.
+- `DELETE /api/assets/<name>` deletes a safe asset file from `.simpleagentchat/assets/`.
 
 Asset boundaries:
 
@@ -1004,7 +1024,7 @@ A successful v1 should support:
 - `goal undone <role> <goal_file_name>` withdraws that role's completion agreement.
 - `goal status <goal_file_name>` reports status for every current valid role and reports complete only when all are `done`.
 - `goal recheck <goal_file_name> <reason>` resets all current role approvals for the target goal and emits both a system message and a regular public goal message.
-- `chat.html` renders the Markdown chat transcript with roles and timestamps.
+- `export-html` creates `.simpleagentchat/chat.html`, and that file renders the Markdown chat transcript with roles and timestamps.
 - Deleting a role produces a critical system message telling affected agents to stop.
 - Rejoining agents can determine from fetched history whether `Start` already happened and can resume the role from its previous messages and memory.
 
@@ -1016,6 +1036,6 @@ A successful v1 should support:
 - Asset upload improvements.
 - Message search.
 - Per-agent local cursor files.
-- Export transcript to Markdown or HTML.
+- Export transcript to Markdown.
 - Optional browser notifications.
 - Optional `watch` or long-running agent helper mode.

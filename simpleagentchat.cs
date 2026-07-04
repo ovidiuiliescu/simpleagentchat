@@ -33,7 +33,7 @@ internal static class Program
         {
             if (args.Length == 0)
             {
-                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|goal> ...");
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|goal|export-html> ...");
             }
 
             ErrorWriter.JsonMode = WantsJsonErrors(args);
@@ -46,6 +46,7 @@ internal static class Program
                 "fetch" => await Commands.FetchAsync(rest),
                 "goal" => await Commands.GoalAsync(rest),
                 "serve" => await Commands.ServeAsync(rest),
+                "export-html" => await Commands.ExportHtmlAsync(rest),
                 _ => throw CliException.Usage("unknown_command", $"Unknown command '{command}'.")
             };
         }
@@ -126,6 +127,20 @@ internal static class Commands
         }
 
         return 0;
+    }
+
+    public static Task<int> ExportHtmlAsync(string[] args)
+    {
+        if (args.Length != 0)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs export-html");
+        }
+
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+        HtmlViews.RegenerateChat(workspace);
+        Console.Out.WriteLine(workspace.ChatHtmlPath);
+        return Task.FromResult(0);
     }
 
     public static async Task<int> GoalAsync(string[] args)
@@ -837,7 +852,6 @@ internal sealed class ChatWorkspace
         workspace.EnsureInstructionFiles();
         workspace.EnsureStateFile();
         HtmlViews.WriteUiShell(workspace);
-        HtmlViews.RegenerateChat(workspace);
         return workspace;
     }
 
@@ -1202,7 +1216,6 @@ internal sealed class GoalStatusStore
             SyncCurrentRoles(document, goalName);
             WriteDocument(goalName, document);
             await store.WriteMessageFileNoRetryAsync(message);
-            HtmlViews.RegenerateChat(_workspace);
         });
 
         return message;
@@ -1242,7 +1255,6 @@ internal sealed class GoalStatusStore
             WriteDocument(goalName, document);
             await store.WriteMessageFileNoRetryAsync(system);
             await store.WriteMessageFileNoRetryAsync(goalMessage);
-            HtmlViews.RegenerateChat(_workspace);
         });
 
         return new RecheckMessages(system, goalMessage);
@@ -1397,7 +1409,10 @@ internal sealed class LocalServer
     private readonly ChatWorkspace _workspace;
     private readonly int? _requestedPort;
     private readonly bool _noOpen;
+    private readonly object _eventClientsLock = new();
+    private readonly List<ServerEventClient> _eventClients = new();
     private int _port;
+    private int _eventSequence;
 
     public LocalServer(ChatWorkspace workspace, int? requestedPort, bool noOpen)
     {
@@ -1409,6 +1424,7 @@ internal sealed class LocalServer
     public async Task<int> RunAsync()
     {
         using var listener = StartListener();
+        using var watchers = new DisposableWatchers(StartWatchers());
         var url = $"http://127.0.0.1:{_port}/";
         if (_noOpen)
         {
@@ -1454,6 +1470,57 @@ internal sealed class LocalServer
         }
 
         return 0;
+    }
+
+    private IReadOnlyList<FileSystemWatcher> StartWatchers()
+    {
+        var watchers = new List<FileSystemWatcher>();
+        AddWatcher(_workspace.MessagesDir, "messages", includeSubdirectories: false);
+        AddWatcher(_workspace.RolesDir, "roles", includeSubdirectories: true);
+        AddWatcher(_workspace.GoalsDir, "goals", includeSubdirectories: false);
+        AddWatcher(_workspace.GoalStatusDir, "goals", includeSubdirectories: false);
+        AddWatcher(_workspace.AssetsDir, "assets", includeSubdirectories: false);
+        return watchers;
+
+        void AddWatcher(string path, string eventName, bool includeSubdirectories)
+        {
+            if (!Directory.Exists(path))
+            {
+                return;
+            }
+
+            var watcher = new FileSystemWatcher(path)
+            {
+                IncludeSubdirectories = includeSubdirectories,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size
+            };
+            FileSystemEventHandler changed = (_, eventArgs) =>
+            {
+                if (ShouldBroadcastFileEvent(eventArgs.FullPath))
+                {
+                    BroadcastEvent(eventName);
+                }
+            };
+            RenamedEventHandler renamed = (_, eventArgs) =>
+            {
+                if (ShouldBroadcastFileEvent(eventArgs.FullPath) || ShouldBroadcastFileEvent(eventArgs.OldFullPath))
+                {
+                    BroadcastEvent(eventName);
+                }
+            };
+            watcher.Created += changed;
+            watcher.Changed += changed;
+            watcher.Deleted += changed;
+            watcher.Renamed += renamed;
+            watcher.EnableRaisingEvents = true;
+            watchers.Add(watcher);
+        }
+    }
+
+    private static bool ShouldBroadcastFileEvent(string path)
+    {
+        var name = Path.GetFileName(path);
+        return !string.IsNullOrWhiteSpace(name) && !name.StartsWith(".", StringComparison.Ordinal);
     }
 
     private HttpListener StartListener()
@@ -1530,8 +1597,8 @@ internal sealed class LocalServer
 
         if (segments is ["chat.html"] && method == "GET")
         {
-            HtmlViews.RegenerateChat(_workspace);
-            await SendFileAsync(context, _workspace.ChatHtmlPath, "text/html; charset=utf-8", attachment: false);
+            var bytes = Encoding.UTF8.GetBytes(HtmlViews.RenderChat(_workspace));
+            await WriteBytesAsync(context, 200, "text/html; charset=utf-8", bytes);
             return;
         }
 
@@ -1567,6 +1634,12 @@ internal sealed class LocalServer
             }
         }
 
+        if (segments.Length == 2 && segments[1] == "events" && method == "GET")
+        {
+            await StreamEventsAsync(context);
+            return;
+        }
+
         if (segments.Length >= 2 && segments[1] == "roles")
         {
             await RouteRolesAsync(context, method, segments);
@@ -1588,6 +1661,78 @@ internal sealed class LocalServer
         throw new ApiException(404, "not_found", "API endpoint not found.");
     }
 
+    private async Task StreamEventsAsync(HttpListenerContext context)
+    {
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = "text/event-stream; charset=utf-8";
+        context.Response.SendChunked = true;
+        context.Response.Headers["Cache-Control"] = "no-cache";
+
+        await using var writer = new StreamWriter(context.Response.OutputStream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), bufferSize: 1024, leaveOpen: true)
+        {
+            AutoFlush = true
+        };
+        var client = new ServerEventClient(writer);
+        lock (_eventClientsLock)
+        {
+            _eventClients.Add(client);
+        }
+
+        try
+        {
+            await writer.WriteAsync(": connected\n\n");
+            while (true)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(25));
+                await writer.WriteAsync(": heartbeat\n\n");
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or HttpListenerException)
+        {
+        }
+        finally
+        {
+            lock (_eventClientsLock)
+            {
+                _eventClients.Remove(client);
+            }
+        }
+    }
+
+    private void BroadcastEvent(string eventName)
+    {
+        ServerEventClient[] clients;
+        lock (_eventClientsLock)
+        {
+            clients = _eventClients.ToArray();
+        }
+
+        if (clients.Length == 0)
+        {
+            return;
+        }
+
+        var id = Interlocked.Increment(ref _eventSequence);
+        var payload = Json.Text(new { type = eventName, updatedAtUtc = Time.UtcNowRoundTrip() });
+        foreach (var client in clients)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await client.WriteAsync(id, eventName, payload);
+                }
+                catch (Exception ex) when (ex is IOException or ObjectDisposedException or HttpListenerException)
+                {
+                    lock (_eventClientsLock)
+                    {
+                        _eventClients.Remove(client);
+                    }
+                }
+            });
+        }
+    }
+
     private async Task GetMessagesAsync(HttpListenerContext context)
     {
         var query = context.Request.QueryString;
@@ -1602,7 +1747,12 @@ internal sealed class LocalServer
             ? true
             : ParseBool(query["includeSystem"]!, "includeSystem");
         var response = await new MessageStore(_workspace).FetchAsync(cursor, includeSystem, waitMs);
-        await WriteJsonAsync(context, 200, response);
+        await WriteJsonAsync(context, 200, new
+        {
+            response.NextCursor,
+            response.TimedOut,
+            Messages = response.Messages.Select(ToApiMessage).ToArray()
+        });
     }
 
     private async Task PostMessageAsync(HttpListenerContext context)
@@ -1616,8 +1766,19 @@ internal sealed class LocalServer
         }
 
         var message = await new MessageStore(_workspace).AppendAsync("human", "chat.message", markdown, Array.Empty<string>(), 30000);
-        await WriteJsonAsync(context, 200, new { message, nextCursor = message.Id });
+        await WriteJsonAsync(context, 200, new { message = ToApiMessage(message), nextCursor = message.Id });
     }
+
+    private static object ToApiMessage(Message message) => new
+    {
+        message.Id,
+        message.TimestampUtc,
+        message.Role,
+        message.Kind,
+        message.Markdown,
+        Html = Markdown.ToHtml(message.Markdown),
+        message.ChangedPaths
+    };
 
     private async Task RouteRolesAsync(HttpListenerContext context, string method, string[] segments)
     {
@@ -1637,6 +1798,12 @@ internal sealed class LocalServer
                 };
             }).ToArray();
             await WriteJsonAsync(context, 200, new { roles });
+            return;
+        }
+
+        if (segments.Length == 2 && method == "POST")
+        {
+            await PostRoleAsync(context);
             return;
         }
 
@@ -1661,6 +1828,12 @@ internal sealed class LocalServer
         if (segments.Length == 4 && method == "PUT" && segments[3] == "memory")
         {
             await PutRoleMemoryAsync(context, segments[2]);
+            return;
+        }
+
+        if (segments.Length == 4 && method == "POST" && segments[3] == "rename")
+        {
+            await RenameRoleAsync(context, segments[2]);
             return;
         }
 
@@ -1708,6 +1881,88 @@ internal sealed class LocalServer
             new[] { changedPath },
             30000);
         await WriteJsonAsync(context, 200, new { role, message });
+    }
+
+    private async Task PostRoleAsync(HttpListenerContext context)
+    {
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var role = GetString(document, "role") ?? "";
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = _workspace.RoleDirectory(role);
+        if (Directory.Exists(dir))
+        {
+            throw new ApiException(409, "role_exists", $"Role '{role}' already exists.");
+        }
+
+        _workspace.EnsureRoleFiles(role);
+        var instructionsPath = Path.Combine(dir, "instructions.md");
+        var memoryPath = Path.Combine(dir, "role_memory.md");
+        var instructions = GetString(document, "instructions");
+        var memory = GetString(document, "memory");
+        if (instructions is not null)
+        {
+            Atomic.WriteText(instructionsPath, instructions);
+        }
+
+        if (memory is not null)
+        {
+            Atomic.WriteText(memoryPath, memory);
+        }
+
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "roles.changed",
+            "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
+            new[] { RootRelative(instructionsPath), RootRelative(memoryPath) },
+            30000);
+        await WriteJsonAsync(context, 200, new { role, message });
+    }
+
+    private async Task RenameRoleAsync(HttpListenerContext context, string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var newRole = GetString(document, "role") ?? "";
+        if (!NameRules.IsValidRoleName(newRole, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "New role name is not safe.");
+        }
+
+        if (string.Equals(role, newRole, StringComparison.Ordinal))
+        {
+            await WriteJsonAsync(context, 200, new { role, renamed = false });
+            return;
+        }
+
+        var oldDir = _workspace.RoleDirectory(role);
+        var newDir = _workspace.RoleDirectory(newRole);
+        if (!Directory.Exists(oldDir))
+        {
+            throw new ApiException(404, "missing_role", $"Role '{role}' does not exist.");
+        }
+
+        if (Directory.Exists(newDir))
+        {
+            throw new ApiException(409, "role_exists", $"Role '{newRole}' already exists.");
+        }
+
+        Directory.Move(oldDir, newDir);
+        UpdateGoalStatusRoleName(role, newRole);
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "roles.changed",
+            "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
+            new[] { RootRelative(oldDir), RootRelative(newDir) },
+            30000);
+        await WriteJsonAsync(context, 200, new { role = newRole, renamed = true, message });
     }
 
     private async Task PutRoleMemoryAsync(HttpListenerContext context, string role)
@@ -1776,6 +2031,12 @@ internal sealed class LocalServer
             return;
         }
 
+        if (segments.Length == 2 && method == "POST")
+        {
+            await PostGoalAsync(context);
+            return;
+        }
+
         if (segments.Length == 3 && method == "GET")
         {
             await WriteJsonAsync(context, 200, ReadGoal(segments[2]));
@@ -1791,6 +2052,12 @@ internal sealed class LocalServer
         if (segments.Length == 3 && method == "DELETE")
         {
             await DeleteGoalAsync(context, segments[2]);
+            return;
+        }
+
+        if (segments.Length == 4 && method == "POST" && segments[3] == "rename")
+        {
+            await RenameGoalAsync(context, segments[2]);
             return;
         }
 
@@ -1836,10 +2103,92 @@ internal sealed class LocalServer
             Atomic.WriteText(goalPath, content);
             new GoalStatusStore(_workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
             await store.WriteMessageFileNoRetryAsync(message);
-            HtmlViews.RegenerateChat(_workspace);
         });
 
         await WriteJsonAsync(context, 200, new { name, message });
+    }
+
+    private async Task PostGoalAsync(HttpListenerContext context)
+    {
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var name = GetString(document, "name") ?? "";
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        var goalPath = _workspace.GoalPath(name);
+        if (File.Exists(goalPath))
+        {
+            throw new ApiException(409, "goal_exists", $"Goal '{name}' already exists.");
+        }
+
+        var content = GetString(document, "content") ?? "";
+        Atomic.WriteText(goalPath, content);
+        var store = new MessageStore(_workspace);
+        var message = store.NewMessage(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(goalPath), RootRelative(_workspace.GoalStatusPath(name)) });
+        new GoalStatusStore(_workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
+        await store.AppendPreparedBatchAsync(new[] { message }, 30000);
+        await WriteJsonAsync(context, 200, new { name, message });
+    }
+
+    private async Task RenameGoalAsync(HttpListenerContext context, string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var newName = GetString(document, "name") ?? "";
+        if (!NameRules.IsValidGoalOrAssetName(newName))
+        {
+            throw CliException.Validation("invalid_goal", "New goal file name is not safe.");
+        }
+
+        if (string.Equals(name, newName, StringComparison.Ordinal))
+        {
+            await WriteJsonAsync(context, 200, new { name, renamed = false });
+            return;
+        }
+
+        var oldGoalPath = _workspace.GoalPath(name);
+        var newGoalPath = _workspace.GoalPath(newName);
+        if (!File.Exists(oldGoalPath))
+        {
+            throw new ApiException(404, "missing_goal", $"Goal '{name}' does not exist.");
+        }
+
+        if (File.Exists(newGoalPath))
+        {
+            throw new ApiException(409, "goal_exists", $"Goal '{newName}' already exists.");
+        }
+
+        var oldStatusPath = _workspace.GoalStatusPath(name);
+        var newStatusPath = _workspace.GoalStatusPath(newName);
+        if (File.Exists(newStatusPath))
+        {
+            throw new ApiException(409, "goal_status_exists", $"Goal status for '{newName}' already exists.");
+        }
+
+        File.Move(oldGoalPath, newGoalPath);
+        if (File.Exists(oldStatusPath))
+        {
+            File.Move(oldStatusPath, newStatusPath);
+            RewriteGoalStatusName(newStatusPath, newName);
+        }
+
+        var message = await new MessageStore(_workspace).AppendAsync(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(oldGoalPath), RootRelative(newGoalPath), RootRelative(oldStatusPath), RootRelative(newStatusPath) },
+            30000);
+        await WriteJsonAsync(context, 200, new { name = newName, renamed = true, message });
     }
 
     private async Task DeleteGoalAsync(HttpListenerContext context, string name)
@@ -1892,6 +2241,12 @@ internal sealed class LocalServer
         if (segments.Length == 3 && method == "PUT")
         {
             await PutAssetAsync(context, segments[2]);
+            return;
+        }
+
+        if (segments.Length == 3 && method == "DELETE")
+        {
+            await DeleteAssetAsync(context, segments[2]);
             return;
         }
 
@@ -1954,6 +2309,23 @@ internal sealed class LocalServer
 
         File.Move(tempPath, path, overwrite: true);
         await WriteJsonAsync(context, 200, new { name, length = total });
+    }
+
+    private async Task DeleteAssetAsync(HttpListenerContext context, string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
+        }
+
+        var path = _workspace.AssetPath(name);
+        if (!File.Exists(path))
+        {
+            throw new ApiException(404, "missing_asset", $"Asset '{name}' does not exist.");
+        }
+
+        File.Delete(path);
+        await WriteJsonAsync(context, 200, new { name, deleted = true });
     }
 
     private async Task RouteAssetFileAsync(HttpListenerContext context, string method, string[] segments)
@@ -2095,6 +2467,61 @@ internal sealed class LocalServer
     {
         return Path.GetRelativePath(_workspace.Root, fullPath).Replace('\\', '/');
     }
+
+    private void UpdateGoalStatusRoleName(string oldRole, string newRole)
+    {
+        if (!Directory.Exists(_workspace.GoalStatusDir))
+        {
+            return;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(_workspace.GoalStatusDir, "*.status.json"))
+        {
+            try
+            {
+                var document = JsonSerializer.Deserialize<GoalStatusDocument>(File.ReadAllText(file, Encoding.UTF8), Json.Options);
+                if (document?.Roles is null || !document.Roles.TryGetValue(oldRole, out var entry))
+                {
+                    continue;
+                }
+
+                document.Roles.Remove(oldRole);
+                document.Roles[newRole] = entry;
+                document.Complete = RecomputeGoalComplete(document);
+                Atomic.WriteText(file, Json.Text(document) + "\n");
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+        }
+    }
+
+    private void RewriteGoalStatusName(string statusPath, string newName)
+    {
+        try
+        {
+            var document = JsonSerializer.Deserialize<GoalStatusDocument>(File.ReadAllText(statusPath, Encoding.UTF8), Json.Options);
+            if (document is null)
+            {
+                return;
+            }
+
+            document.Goal = newName;
+            document.Complete = RecomputeGoalComplete(document);
+            Atomic.WriteText(statusPath, Json.Text(document) + "\n");
+        }
+        catch (JsonException)
+        {
+        }
+    }
+
+    private bool RecomputeGoalComplete(GoalStatusDocument document)
+    {
+        var roles = _workspace.GetRoleNames();
+        return roles.Count > 0 &&
+               roles.All(role => document.Roles.TryGetValue(role, out var entry) && entry.Status == "done");
+    }
 }
 
 internal sealed class ApiException : Exception
@@ -2107,6 +2534,53 @@ internal sealed class ApiException : Exception
     {
         StatusCode = statusCode;
         Code = code;
+    }
+}
+
+internal sealed class ServerEventClient
+{
+    private readonly StreamWriter _writer;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+    public ServerEventClient(StreamWriter writer)
+    {
+        _writer = writer;
+    }
+
+    public async Task WriteAsync(int id, string eventName, string payload)
+    {
+        await _writeLock.WaitAsync();
+        try
+        {
+            await _writer.WriteAsync($"id: {id}\n");
+            await _writer.WriteAsync($"event: {eventName}\n");
+            await _writer.WriteAsync("data: ");
+            await _writer.WriteAsync(payload.Replace("\r", "", StringComparison.Ordinal).Replace("\n", "\\n", StringComparison.Ordinal));
+            await _writer.WriteAsync("\n\n");
+            await _writer.FlushAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+}
+
+internal sealed class DisposableWatchers : IDisposable
+{
+    private readonly IReadOnlyList<FileSystemWatcher> _watchers;
+
+    public DisposableWatchers(IReadOnlyList<FileSystemWatcher> watchers)
+    {
+        _watchers = watchers;
+    }
+
+    public void Dispose()
+    {
+        foreach (var watcher in _watchers)
+        {
+            watcher.Dispose();
+        }
     }
 }
 
@@ -2146,8 +2620,6 @@ internal sealed class MessageStore
             {
                 await WriteMessageFileNoRetryAsync(message);
             }
-
-            HtmlViews.RegenerateChat(_workspace);
         });
     }
 
@@ -2313,6 +2785,11 @@ internal static class HtmlViews
 {
     public static void RegenerateChat(ChatWorkspace workspace)
     {
+        Atomic.WriteText(workspace.ChatHtmlPath, RenderChat(workspace));
+    }
+
+    public static string RenderChat(ChatWorkspace workspace)
+    {
         var store = new MessageStore(workspace);
         var messages = store.ReadAllMessages();
         var builder = new StringBuilder();
@@ -2321,7 +2798,6 @@ internal static class HtmlViews
         builder.AppendLine("<head>");
         builder.AppendLine("<meta charset=\"utf-8\">");
         builder.AppendLine("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-        builder.AppendLine("<meta http-equiv=\"refresh\" content=\"5\">");
         builder.AppendLine("<title>simpleagentchat transcript</title>");
         builder.AppendLine("<style>");
         builder.AppendLine("body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f7f7f4;color:#1d1d1f}main{max-width:980px;margin:0 auto;padding:24px}.message{border-top:1px solid #d8d8d2;padding:16px 0}.meta{font-size:12px;color:#5f6368;display:flex;gap:10px;flex-wrap:wrap}.role{font-weight:700;color:#1b4d3e}.system .role{color:#8a4600}.human .role{color:#164c86}.goal .role{color:#6f3d91}.markdown{line-height:1.55}.markdown pre{background:#202124;color:#f5f5f5;padding:12px;overflow:auto}.markdown code{background:#ededdf;padding:1px 4px;border-radius:3px}.markdown pre code{background:transparent;padding:0}.empty{color:#5f6368}</style>");
@@ -2345,7 +2821,7 @@ internal static class HtmlViews
         }
 
         builder.AppendLine("</main></body></html>");
-        Atomic.WriteText(workspace.ChatHtmlPath, builder.ToString());
+        return builder.ToString();
     }
 
     public static void WriteUiShell(ChatWorkspace workspace)
@@ -2385,19 +2861,34 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .row>*{flex:1}
 .row button,.row input[type=checkbox]{flex:0 0 auto}
+.chat-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.critical-toggle{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;user-select:none}
+.critical-toggle input{width:auto;margin:0}
 .fields{display:grid;gap:10px}
 .field{display:grid;gap:5px}
 .field span{color:var(--muted);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .formbar{display:grid;grid-template-columns:minmax(130px,1fr) minmax(130px,1fr) auto auto;gap:8px;align-items:end}
+.formbar.manage{grid-template-columns:minmax(120px,1fr) minmax(120px,1fr) auto auto auto}
 .formbar.assets{grid-template-columns:minmax(130px,1fr) minmax(170px,1fr) auto}
 .tabs{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .tabs button[aria-selected=true]{background:#173d36;color:#fff;border-color:#173d36}
-iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);background:#fff}
+.chat-log{height:62vh;overflow:auto;border-bottom:1px solid var(--line);background:#fff;padding:12px 14px}
+.message{border-top:1px solid var(--line);padding:12px 0}
+.message:first-child{border-top:0}
+.message-meta{font-size:12px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap}
+.message-role{font-weight:700;color:var(--accent)}
+.message.system .message-role{color:#8a4600}
+.message.human .message-role{color:#164c86}
+.message.goal .message-role{color:#6f3d91}
+.markdown{line-height:1.55}
+.markdown pre{background:#202124;color:#f5f5f5;padding:10px;overflow:auto;border-radius:6px}
+.markdown code{background:#ededdf;padding:1px 4px;border-radius:3px}
+.markdown pre code{background:transparent;padding:0}
 .list{display:grid;gap:6px;margin:8px 0}
 .item{display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:8px;background:#fff}
 .muted{color:var(--muted);font-size:13px}
 .stack{display:grid;gap:12px}
-@media(max-width:900px){main{grid-template-columns:1fr}iframe{height:52vh}.formbar,.formbar.assets{grid-template-columns:1fr}.formbar button{width:100%}}
+@media(max-width:900px){main{grid-template-columns:1fr}.chat-log{height:52vh}.formbar,.formbar.manage,.formbar.assets{grid-template-columns:1fr}.formbar button{width:100%}}
 </style>
 </head>
 <body>
@@ -2405,10 +2896,10 @@ iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);backg
 <main>
 <section>
 <h2>Chat</h2>
-<iframe id="chatFrame" src="/chat.html" title="Chat transcript"></iframe>
+<div id="chatLog" class="chat-log" aria-live="polite"></div>
 <div class="body stack">
 <textarea id="message" placeholder="Message"></textarea>
-<div class="row"><label class="muted"><input id="critical" type="checkbox"> Critical</label><button class="primary" onclick="sendMessage()">Send</button><button onclick="refreshAll()">Refresh</button></div>
+<div class="chat-actions"><label class="critical-toggle"><input id="critical" type="checkbox"> Critical</label><button class="primary" onclick="sendMessage()">Send</button><button onclick="refreshAll()">Refresh</button></div>
 </div>
 </section>
 <section>
@@ -2419,14 +2910,15 @@ iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);backg
 </div>
 <div class="body">
 <div id="rolesPanel" class="stack">
-<div class="formbar"><label class="field"><span>Role</span><select id="roleSelect" onchange="loadRole()"></select></label><label class="field"><span>Name</span><input id="roleName" placeholder="new-role"></label><button onclick="saveRole()">Save</button><button class="danger" onclick="deleteRole()">Delete</button></div>
+<div class="formbar manage"><label class="field"><span>Role</span><select id="roleSelect" onchange="loadRole()"></select></label><label class="field"><span>Name</span><input id="roleName" placeholder="new-role"></label><button onclick="renameRole()">Rename</button><button onclick="addRole()">Add new role</button><button class="danger" onclick="deleteRole()">Delete</button></div>
 <label class="field"><span>Instructions</span><textarea id="roleInstructions"></textarea></label>
 <label class="field"><span>Memory</span><textarea id="roleMemory"></textarea></label>
 <div class="row"><button onclick="saveRoleInstructions()">Save instructions</button><button onclick="saveRoleMemory()">Save memory</button></div>
 </div>
 <div id="goalsPanel" class="stack" hidden>
-<div class="formbar"><label class="field"><span>Goal</span><select id="goalSelect" onchange="loadGoal()"></select></label><label class="field"><span>Name</span><input id="goalName" placeholder="goal.md"></label><button onclick="saveGoal()">Save</button><button class="danger" onclick="deleteGoal()">Delete</button></div>
+<div class="formbar manage"><label class="field"><span>Goal</span><select id="goalSelect" onchange="loadGoal()"></select></label><label class="field"><span>Name</span><input id="goalName" placeholder="goal.md"></label><button onclick="renameGoal()">Rename</button><button onclick="addGoal()">Add new goal</button><button class="danger" onclick="deleteGoal()">Delete</button></div>
 <label class="field"><span>Content</span><textarea id="goalContent"></textarea></label>
+<div class="row"><button onclick="saveGoal()">Save goal</button></div>
 </div>
 <div id="assetsPanel" class="stack" hidden>
 <div class="formbar assets"><label class="field"><span>Name</span><input id="assetName" placeholder="asset.txt"></label><label class="field"><span>File</span><input id="assetFile" type="file"></label><button onclick="uploadAsset()">Upload</button></div>
@@ -2437,26 +2929,40 @@ iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);backg
 </main>
 <script>
 const $=id=>document.getElementById(id);
+let chatCursor=null;
+let chatMessageIds=new Set();
 function setStatus(text){$('status').textContent=text}
 async function api(path, options){const r=await fetch(path, options); if(!r.ok){throw new Error(await r.text())} return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
-function refreshChat(){ $('chatFrame').src='/chat.html?ts='+Date.now() }
-async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets()]); refreshChat(); setStatus('Refreshed')}
-async function sendMessage(){await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; await refreshAll()}
+function text(value){return value==null?'':String(value)}
+function roleClass(role){return text(role).replace(/[^a-zA-Z0-9_-]/g,'-')}
+function chatScrollState(){const log=$('chatLog'); const remaining=log.scrollHeight-log.scrollTop-log.clientHeight; return {top:log.scrollTop,atEnd:remaining<24 || log.scrollHeight<=log.clientHeight+1}}
+function restoreChatScroll(state){const log=$('chatLog'); if(state.atEnd){log.scrollTop=log.scrollHeight}else{log.scrollTop=Math.min(state.top,Math.max(0,log.scrollHeight-log.clientHeight))}}
+function renderMessage(message){const article=document.createElement('article'); article.className='message '+roleClass(message.role); const meta=document.createElement('div'); meta.className='message-meta'; for(const value of [message.role,message.timestampUtc,message.kind,message.id]){const span=document.createElement('span'); span.textContent=text(value); if(value===message.role)span.className='message-role'; meta.appendChild(span)} const body=document.createElement('div'); body.className='markdown'; body.innerHTML=text(message.html); article.appendChild(meta); article.appendChild(body); return article}
+function renderChat(messages,replace){const log=$('chatLog'); if(replace){log.textContent=''; chatMessageIds=new Set()} if(messages.length===0 && chatMessageIds.size===0){log.innerHTML='<p class="empty">No messages yet.</p>'; return} const empty=log.querySelector('.empty'); if(empty)empty.remove(); for(const message of messages){if(chatMessageIds.has(message.id))continue; log.appendChild(renderMessage(message)); chatMessageIds.add(message.id)}}
+async function refreshChat(){const state=chatScrollState(); const data=await api('/api/messages?includeSystem=true&waitMs=0'); renderChat(data.messages||[],true); chatCursor=data.nextCursor||chatCursor; restoreChatScroll(state)}
+async function loadNewMessages(){const state=chatScrollState(); const query='/api/messages?includeSystem=true&waitMs=0'+(chatCursor?'&cursor='+encodeURIComponent(chatCursor):''); const data=await api(query); renderChat(data.messages||[],!chatCursor); chatCursor=data.nextCursor||chatCursor; restoreChatScroll(state)}
+async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets(),refreshChat()]); setStatus('Refreshed')}
+async function sendMessage(){const state=chatScrollState(); const data=await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; renderChat([data.message],false); chatCursor=data.nextCursor||data.message?.id||chatCursor; restoreChatScroll(state); setStatus('Sent')}
 function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
-async function loadRoles(){const data=await api('/api/roles'); $('roleSelect').innerHTML=data.roles.map(r=>`<option>${r.role}</option>`).join(''); if(data.roles.length) await loadRole()}
+async function loadRoles(selected){const data=await api('/api/roles'); $('roleSelect').innerHTML=data.roles.map(r=>`<option>${r.role}</option>`).join(''); if(selected){$('roleSelect').value=selected} if(data.roles.length) await loadRole(); else {$('roleName').value=''; $('roleInstructions').value=''; $('roleMemory').value=''}}
 async function loadRole(){const role=$('roleSelect').value; if(!role)return; const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory}
-async function saveRole(){const role=$('roleName').value || $('roleSelect').value; const instructions=$('roleInstructions').value; const memory=$('roleMemory').value; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:instructions})}); await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:memory})}); await refreshAll()}
-async function saveRoleInstructions(){const role=$('roleName').value || $('roleSelect').value; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles()}
-async function saveRoleMemory(){const role=$('roleName').value || $('roleSelect').value; await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleMemory').value})}); await loadRoles()}
+async function addRole(){const role=$('roleName').value.trim(); if(!role)return; await api('/api/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role,instructions:$('roleInstructions').value,memory:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
+async function renameRole(){const role=$('roleSelect').value; const next=$('roleName').value.trim(); if(!role||!next)return; await api('/api/roles/'+encodeURIComponent(role)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:next})}); await loadRoles(next); await loadNewMessages()}
+async function saveRoleInstructions(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles(role); await loadNewMessages()}
+async function saveRoleMemory(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
 async function deleteRole(){const role=$('roleSelect').value; if(role){await api('/api/roles/'+encodeURIComponent(role),{method:'DELETE'}); await refreshAll()}}
-async function loadGoals(){const data=await api('/api/goals'); $('goalSelect').innerHTML=data.goals.map(g=>`<option>${g.name}</option>`).join(''); if(data.goals.length) await loadGoal(); else $('goalContent').value=''}
+async function loadGoals(selected){const data=await api('/api/goals'); $('goalSelect').innerHTML=data.goals.map(g=>`<option>${g.name}</option>`).join(''); if(selected){$('goalSelect').value=selected} if(data.goals.length) await loadGoal(); else {$('goalName').value=''; $('goalContent').value=''}}
 async function loadGoal(){const name=$('goalSelect').value; if(!name)return; const data=await api('/api/goals/'+encodeURIComponent(name)); $('goalName').value=data.name; $('goalContent').value=data.content}
-async function saveGoal(){const name=$('goalName').value || $('goalSelect').value; await api('/api/goals/'+encodeURIComponent(name),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:$('goalContent').value})}); await refreshAll()}
+async function addGoal(){const name=$('goalName').value.trim(); if(!name)return; await api('/api/goals',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,content:$('goalContent').value})}); await loadGoals(name); await loadNewMessages()}
+async function renameGoal(){const name=$('goalSelect').value; const next=$('goalName').value.trim(); if(!name||!next)return; await api('/api/goals/'+encodeURIComponent(name)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:next})}); await loadGoals(next); await loadNewMessages()}
+async function saveGoal(){const name=$('goalSelect').value; if(!name)return; await api('/api/goals/'+encodeURIComponent(name),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:$('goalContent').value})}); await loadGoals(name); await loadNewMessages()}
 async function deleteGoal(){const name=$('goalSelect').value; if(name){await api('/api/goals/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}}
-async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span></div>`).join('')}
+async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span><button class="danger" onclick="deleteAsset('${a.name}')">Delete</button></div>`).join('')}
 async function uploadAsset(){const file=$('assetFile').files[0]; const name=$('assetName').value || file?.name; if(!file||!name)return; await fetch('/api/assets/'+encodeURIComponent(name),{method:'PUT',body:file}).then(async r=>{if(!r.ok)throw new Error(await r.text())}); await refreshAll()}
+async function deleteAsset(name){await api('/api/assets/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}
+function connectEvents(){if(!window.EventSource){setInterval(()=>loadNewMessages().catch(e=>setStatus(e.message)),30000); return} const events=new EventSource('/api/events'); events.onopen=()=>setStatus('Live'); events.addEventListener('messages',()=>loadNewMessages().catch(e=>setStatus(e.message))); events.addEventListener('roles',()=>{loadRoles().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('goals',()=>{loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('assets',()=>loadAssets().catch(e=>setStatus(e.message))); events.onerror=()=>setStatus('Reconnecting')}
 refreshAll().catch(e=>setStatus(e.message));
-setInterval(refreshChat,5000);
+connectEvents();
 </script>
 </body>
 </html>
@@ -2586,7 +3092,26 @@ internal static class Markdown
         var encoded = WebUtility.HtmlEncode(text);
         encoded = Regex.Replace(encoded, "`([^`]+)`", "<code>$1</code>");
         encoded = Regex.Replace(encoded, "\\*\\*([^*]+)\\*\\*", "<strong>$1</strong>");
+        encoded = Regex.Replace(encoded, "\\[([^\\]]+)\\]\\(([^\\s)]+)\\)", match =>
+        {
+            var href = WebUtility.HtmlDecode(match.Groups[2].Value);
+            if (!IsSafeHref(href))
+            {
+                return match.Value;
+            }
+
+            var attribute = WebUtility.HtmlEncode(href);
+            return $"<a href=\"{attribute}\" target=\"_blank\" rel=\"noopener noreferrer\">{match.Groups[1].Value}</a>";
+        });
         return encoded;
+    }
+
+    private static bool IsSafeHref(string href)
+    {
+        return href.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
+               href.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+               href.StartsWith("/assets/", StringComparison.Ordinal) ||
+               href.StartsWith("assets/", StringComparison.Ordinal);
     }
 }
 

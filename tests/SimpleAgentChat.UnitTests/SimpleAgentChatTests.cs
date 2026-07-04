@@ -14,7 +14,10 @@ internal static class SimpleAgentChatTests
             ("goal parser handles status, mark, and recheck forms", TestGoalParser),
             ("serve parser handles port and browser options", TestServeParser),
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
+            ("markdown renderer covers common chat shapes", TestMarkdownCommonShapes),
             ("initialization creates implementer and reviewer default roles", TestDefaultRoles),
+            ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
+            ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
             ("goal status store computes current role completion", TestGoalStatusStore)
         };
 
@@ -122,6 +125,19 @@ internal static class SimpleAgentChatTests
         return Task.CompletedTask;
     }
 
+    private static Task TestMarkdownCommonShapes()
+    {
+        var html = Markdown.ToHtml("# Heading\n\n- item\n\n```cs\n<int>\n```\n\nUse `code`, **bold**, [asset](assets/report.md), and [bad](javascript:alert(1)).");
+        Assert(html.Contains("<h1>Heading</h1>", StringComparison.Ordinal), "heading should render");
+        Assert(html.Contains("<li>item</li>", StringComparison.Ordinal), "list item should render");
+        Assert(html.Contains("&lt;int&gt;", StringComparison.Ordinal), "code block should escape html");
+        Assert(html.Contains("<code>code</code>", StringComparison.Ordinal), "inline code should render");
+        Assert(html.Contains("<strong>bold</strong>", StringComparison.Ordinal), "bold should render");
+        Assert(html.Contains("<a href=\"assets/report.md\" target=\"_blank\" rel=\"noopener noreferrer\">asset</a>", StringComparison.Ordinal), "safe asset link should render");
+        Assert(!html.Contains("href=\"javascript:alert(1)\"", StringComparison.OrdinalIgnoreCase), "unsafe link should not render");
+        return Task.CompletedTask;
+    }
+
     private static Task TestDefaultRoles()
     {
         var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
@@ -146,6 +162,53 @@ internal static class SimpleAgentChatTests
         }
 
         return Task.CompletedTask;
+    }
+
+    private static Task TestUiShellManagementControls()
+    {
+        Assert(UiShell.Html.Contains("Add new role", StringComparison.Ordinal), "role add button missing");
+        Assert(UiShell.Html.Contains("renameRole()", StringComparison.Ordinal), "role rename action missing");
+        Assert(UiShell.Html.Contains("Add new goal", StringComparison.Ordinal), "goal add button missing");
+        Assert(UiShell.Html.Contains("renameGoal()", StringComparison.Ordinal), "goal rename action missing");
+        Assert(UiShell.Html.Contains("saveGoal()", StringComparison.Ordinal), "goal save action missing");
+        Assert(UiShell.Html.Contains("deleteAsset", StringComparison.Ordinal), "asset delete action missing");
+        Assert(UiShell.Html.Contains("EventSource('/api/events')", StringComparison.Ordinal), "live event stream missing");
+        Assert(UiShell.Html.Contains("id=\"chatLog\"", StringComparison.Ordinal), "chat log container missing");
+        Assert(UiShell.Html.Contains("renderChat", StringComparison.Ordinal), "client-side chat rendering missing");
+        Assert(UiShell.Html.Contains("loadNewMessages", StringComparison.Ordinal), "incremental message load missing");
+        Assert(UiShell.Html.Contains("chatScrollState()", StringComparison.Ordinal), "chat scroll preservation missing");
+        Assert(UiShell.Html.Contains("critical-toggle", StringComparison.Ordinal), "critical checkbox styling missing");
+        Assert(!UiShell.Html.Contains("<iframe", StringComparison.OrdinalIgnoreCase), "chat UI should not use iframe");
+        Assert(!UiShell.Html.Contains("chatFrame", StringComparison.Ordinal), "chat UI should not depend on chatFrame");
+        Assert(!UiShell.Html.Contains("onclick=\"saveRole()\"", StringComparison.Ordinal), "role save should not create implicitly");
+        Assert(!UiShell.Html.Contains("setInterval(refreshChat,5000)", StringComparison.Ordinal), "chat should not depend on fixed refresh polling when events are available");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestChatHtmlExplicitExport()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            Assert(!File.Exists(workspace.ChatHtmlPath), "chat.html should not be generated during init");
+
+            await new MessageStore(workspace).AppendAsync("implementer", "chat.message", "# Exported", Array.Empty<string>(), 0);
+            Assert(!File.Exists(workspace.ChatHtmlPath), "chat.html should not be generated during normal message writes");
+
+            HtmlViews.RegenerateChat(workspace);
+            var html = File.ReadAllText(workspace.ChatHtmlPath);
+            Assert(html.Contains("<h1>simpleagentchat transcript</h1>", StringComparison.Ordinal), "export should include transcript title");
+            Assert(html.Contains("<h1>Exported</h1>", StringComparison.Ordinal), "export should render message markdown");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
     }
 
     private static async Task TestGoalStatusStore()
