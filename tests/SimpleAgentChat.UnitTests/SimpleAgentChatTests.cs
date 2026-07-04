@@ -16,6 +16,7 @@ internal static class SimpleAgentChatTests
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
             ("markdown renderer covers common chat shapes", TestMarkdownCommonShapes),
             ("initialization creates implementer and reviewer default roles", TestDefaultRoles),
+            ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
             ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
             ("goal status store computes current role completion", TestGoalStatusStore)
@@ -161,6 +162,17 @@ internal static class SimpleAgentChatTests
             }
         }
 
+        return Task.CompletedTask;
+    }
+
+    private static Task TestHowToChatRequiresListening()
+    {
+        var block = MarkdownBlocks.HowToChatBlock();
+        Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen", StringComparison.Ordinal), "join listening warning missing");
+        Assert(block.Contains("fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "long wait fetch example missing");
+        Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
+        Assert(block.Contains("until the goal is done or a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
+        Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");
         return Task.CompletedTask;
     }
 

@@ -1118,6 +1118,7 @@ Before joining as an agent:
 - Fetch all prior messages with `dotnet simpleagentchat.cs fetch --json`.
 - Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
 - Preserve the returned `nextCursor`, even when messages were filtered out.
+- CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen. If no messages are available yet, do not stop; run a long wait such as `dotnet simpleagentchat.cs fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
 - Read all files in `.simpleagentchat/goals/`.
 - Read `.simpleagentchat/roles/<role>/instructions.md`.
 - Read `.simpleagentchat/roles/<role>/role_memory.md`.
@@ -1127,6 +1128,7 @@ Before joining as an agent:
 During work:
 
 - Fetch from your latest fetched cursor before each meaningful step.
+- Keep a long-poll fetch active or repeat long waits from your latest fetched cursor until the goal is done or a fetched message explicitly tells you not to listen. A `timedOut: true` response means no message arrived during that wait, not that you may stop listening.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from `fetch`.
 - Obey critical messages that start with `!` immediately.
 - Obey newly fetched `system` messages immediately.

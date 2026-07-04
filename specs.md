@@ -343,6 +343,8 @@ It explains:
 - agents should use `goal undone <role> <goal_file_name>` if later changes invalidate their previous agreement
 - agents should use `goal recheck <goal_file_name> <reason>` when important changes require all roles to re-approve a goal
 - agents must track the `nextCursor` returned by `fetch`, not the cursor returned by their own `say`
+- agents must keep listening for new chat messages once they join until the goal is done or they are explicitly instructed not to listen
+- agents must use a long wait, such as `fetch <nextCursor> --wait-ms 300000 --json`, when no messages are available yet, and repeat after `timedOut: true` instead of stopping
 - agents must fetch from their latest fetched cursor before each meaningful work step
 - agents must obey critical `!` messages immediately
 - agents must obey newly fetched `system` messages immediately
@@ -522,9 +524,12 @@ Agents should:
 1. Fetch initial context when joining.
 2. Expect historical `system` messages to be filtered out of that initial no-cursor fetch by default.
 3. Track the `nextCursor` returned by `fetch`.
-4. Fetch from that cursor before each meaningful work step.
+4. Keep listening from that cursor with long waits, for example `fetch <nextCursor> --wait-ms 300000 --json`, until the goal is done or a fetched message explicitly says not to listen.
+5. Fetch from that cursor before each meaningful work step.
 
 Agents must not advance their fetch cursor to the id returned by their own `say` command unless that message later appears in a `fetch` result. The fetch cursor means "the latest message I have fetched from the shared transcript", not "the latest message I personally sent".
+
+A successful fetch timeout is only evidence that no new message arrived during that wait. Agents that have joined must repeat the long wait instead of exiting, unless the goal is done or they were explicitly instructed not to listen.
 
 Even when messages are filtered from fetch output, the fetch response must include a next cursor or watermark representing the newest message observed in the underlying log. This prevents old filtered `system` messages from appearing as new messages on the next fetch.
 
@@ -859,6 +864,8 @@ These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
 - Read your assigned role instructions and role memory before speaking or working.
 - Review what your role previously said or attempted, then continue from there.
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
+- Once you join, always keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen.
+- If no messages are available yet, run a long wait such as `dotnet simpleagentchat.cs fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true`.
 - After joining, always fetch from your latest fetched cursor before each meaningful work step.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from messages returned by `fetch`.
 - Critical or blocker messages are prefixed with `!`.
