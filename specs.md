@@ -20,6 +20,10 @@ Agents can also use command-line operations directly:
 dotnet simpleagentchat.cs say <role> <markdown message>
 dotnet simpleagentchat.cs fetch [cursor] [wait-ms]
 dotnet simpleagentchat.cs fetch [--wait-ms <ms>]
+dotnet simpleagentchat.cs goal status <goal_file_name>
+dotnet simpleagentchat.cs goal done <role> <goal_file_name>
+dotnet simpleagentchat.cs goal undone <role> <goal_file_name>
+dotnet simpleagentchat.cs goal recheck <goal_file_name> <reason>
 ```
 
 ## Design Principles
@@ -50,6 +54,7 @@ When initialized, the repository contains:
 ```text
 .simpleagentchat/
   assets/
+  goal_status/
   goals/
   messages/
   roles/
@@ -97,6 +102,7 @@ Allowed base directories:
 
 - roles: `.simpleagentchat/roles/`
 - goals: `.simpleagentchat/goals/`
+- goal status: `.simpleagentchat/goal_status/`
 - assets: `.simpleagentchat/assets/`
 - messages: `.simpleagentchat/messages/`
 
@@ -110,8 +116,11 @@ Role names are directory names and must match:
 
 Reserved role names:
 
+- `goal`
 - `human`
 - `system`
+
+`goal` is reserved for tool-generated public goal-coordination chat messages.
 
 Goal and asset file names must match:
 
@@ -145,9 +154,10 @@ Role deletion may delete only the resolved `.simpleagentchat/roles/<role>/` dire
 Rules:
 
 - Create `.simpleagentchat/`, `assets/`, `goals/`, `messages/`, and `roles/` if missing.
+- Create `.simpleagentchat/goal_status/` if missing.
 - If no valid role directories exist, create the default `implementer` and `reviewer` role directories.
 - For every valid role directory, create `instructions.md` if missing and create `role_memory.md` if missing.
-- Never overwrite existing role instructions, role memory, goals, assets, or message files during initialization.
+- Never overwrite existing role instructions, role memory, goals, goal status files, assets, or message files during initialization.
 - Create `.gitignore` if missing.
 - Add `.simpleagentchat/` to `.gitignore` once. Treat existing `.simpleagentchat` and `.simpleagentchat/` entries as already satisfying this requirement.
 - Preserve all existing `.gitignore` content and line endings as much as practical.
@@ -229,6 +239,52 @@ The UI should let the human create, edit, and delete goals.
 
 When goals change, agents must re-read the goals folder before continuing.
 
+### `.simpleagentchat/goal_status/`
+
+This folder contains current per-role completion state for each goal file. Completion state is tool-managed metadata, but every status change must also be visible in the public chat log.
+
+Recommended status filename shape:
+
+```text
+<goal_file_name>.status.json
+```
+
+Example for `.simpleagentchat/goals/release.md`:
+
+```text
+.simpleagentchat/goal_status/release.md.status.json
+```
+
+Status files should use this shape:
+
+```json
+{
+  "goal": "release.md",
+  "complete": false,
+  "roles": {
+    "implementer": {
+      "status": "done",
+      "updatedAtUtc": "2026-07-04T12:34:56.1234567Z",
+      "messageId": "20260704T123456.1234567Z-implementer-a1b2c3"
+    },
+    "reviewer": {
+      "status": "undone",
+      "updatedAtUtc": "2026-07-04T12:40:00.0000000Z",
+      "messageId": "20260704T124000.0000000Z-reviewer-d4e5f6"
+    }
+  }
+}
+```
+
+Rules:
+
+- A goal is complete only when every current valid role directory has explicitly marked that goal `done`.
+- Roles with no status entry for a goal are treated as `undone`.
+- Deleted roles are ignored for completion. Newly created roles start as `undone` for every existing goal.
+- A role may withdraw agreement at any time by marking the goal `undone`.
+- Editing a goal file through the UI resets completion state for that goal to `undone` for all current roles.
+- Deleting a goal file should delete its status file if present.
+
 ### `.simpleagentchat/assets/`
 
 This folder contains assets that humans or agents want to reference from chat messages. Examples include screenshots, logs, generated reports, documents, or other supporting files.
@@ -282,6 +338,10 @@ It explains:
 - agents must read the goals folder before starting
 - agents must wait for an explicit human `Start` before new work begins unless a prior `Start` already appears in the fetched chat history
 - agents re-joining an existing role must continue from where that role left off instead of acting like a new participant
+- a goal is complete only when all current roles have publicly marked it done
+- agents should use `goal status <goal_file_name>` before claiming a goal is complete
+- agents should use `goal undone <role> <goal_file_name>` if later changes invalidate their previous agreement
+- agents should use `goal recheck <goal_file_name> <reason>` when important changes require all roles to re-approve a goal
 - agents must track the `nextCursor` returned by `fetch`, not the cursor returned by their own `say`
 - agents must fetch from their latest fetched cursor before each meaningful work step
 - agents must obey critical `!` messages immediately
@@ -406,15 +466,17 @@ dotnet simpleagentchat.cs say implementer -- --not-an-option
 
 Sends the literal Markdown `--not-an-option`.
 
-Agents should use normal role names. The `say` command must reject `system`. The `say` command should reject `human` unless a future explicit human-only option is added.
+Agents should use normal role names. The `say` command must reject `goal` and `system`. The `say` command should reject `human` unless a future explicit human-only option is added.
 
 #### Reserved Roles
+
+`goal` is reserved for tool-generated public goal-coordination messages.
 
 `human` is reserved for human messages. The browser UI posts as `human`.
 
 Because this is a local file-based tool, this cannot be perfectly enforced against an agent that can run arbitrary local commands. The tool should still discourage or reject casual `say human ...` use unless an explicit human-oriented option is provided.
 
-`system` is reserved for tool-generated operational messages. Normal agents must not send messages as `system`.
+`system` is reserved for tool-generated operational messages. Normal agents must not send messages as `goal` or `system`.
 
 ### `fetch`
 
@@ -528,6 +590,83 @@ When a command fails, JSON mode should return a JSON error object on stderr:
 }
 ```
 
+### `goal`
+
+```powershell
+dotnet simpleagentchat.cs goal done <role> <goal_file_name> [--wait-ms <ms>]
+dotnet simpleagentchat.cs goal undone <role> <goal_file_name> [--wait-ms <ms>]
+dotnet simpleagentchat.cs goal status <goal_file_name> [--json]
+dotnet simpleagentchat.cs goal recheck <goal_file_name> [--wait-ms <ms>] <reason till end of line>
+```
+
+The `goal` command records and reports public completion agreement for goal files in `.simpleagentchat/goals/`.
+
+Validation:
+
+- `<goal_file_name>` must be a safe goal file name and must exist in `.simpleagentchat/goals/`.
+- `<role>` must be a safe role name and must have a current role directory.
+- `goal` is a reserved role name and cannot be used as an agent role.
+- `reason` for `goal recheck` must be non-empty after trimming whitespace.
+
+`goal done <role> <goal_file_name>` marks that role's status for the goal as `done`, writes the updated status file, appends a public message from `<role>` with kind `goals.done`, regenerates `chat.html`, prints the new message cursor/id to stdout, and exits with code `0`.
+
+`goal undone <role> <goal_file_name>` marks that role's status for the goal as `undone`, writes the updated status file, appends a public message from `<role>` with kind `goals.undone`, regenerates `chat.html`, prints the new message cursor/id to stdout, and exits with code `0`.
+
+`goal status <goal_file_name>` reports the current status for every current valid role. Roles with no explicit entry are reported as `undone`. The goal is complete only when every current valid role is `done`.
+
+When a role is implicitly `undone` because it has no explicit status entry yet, plain-text output omits the timestamp for that role and JSON output uses `null` for `updatedAtUtc` and `messageId`.
+
+Plain-text status output must be stable:
+
+```text
+goal: release.md
+complete: false
+roleCount: 2
+implementer: done 2026-07-04T12:34:56.1234567Z
+reviewer: undone 2026-07-04T12:40:00.0000000Z
+```
+
+With `--json`, status output should use this shape:
+
+```json
+{
+  "goal": "release.md",
+  "complete": false,
+  "roles": [
+    {
+      "role": "implementer",
+      "status": "done",
+      "updatedAtUtc": "2026-07-04T12:34:56.1234567Z",
+      "messageId": "20260704T123456.1234567Z-implementer-a1b2c3"
+    },
+    {
+      "role": "reviewer",
+      "status": "undone",
+      "updatedAtUtc": "2026-07-04T12:40:00.0000000Z",
+      "messageId": "20260704T124000.0000000Z-reviewer-d4e5f6"
+    }
+  ]
+}
+```
+
+`goal recheck <goal_file_name> <reason>` is for important changes that invalidate previous completion agreement. It must:
+
+1. Mark the target goal `undone` for every current valid role.
+2. Write the updated status file.
+3. Append a `system` message with kind `goals.recheck` explaining that all roles must re-check and re-approve the goal.
+4. Append a regular public chat message from the reserved `goal` role with kind `chat.message` and the supplied reason.
+5. Regenerate `chat.html`.
+6. Print both created message cursor ids to stdout in a stable form.
+
+Example `goal recheck` stdout:
+
+```text
+systemCursor: 20260704T124000.0000000Z-system-d4e5f6
+messageCursor: 20260704T124000.0000001Z-goal-a1b2c3
+```
+
+For `goal recheck`, options are parsed only before the first reason token. After the reason begins, every remaining token is part of the reason, even if it looks like an option. A `--` delimiter may be used to make the start of the reason explicit and is required when the reason itself starts with `-`.
+
 ## Message Model
 
 Each message must be represented by a JSON file with this shape:
@@ -562,8 +701,8 @@ Required fields:
 
 - `id`: canonical message id and cursor.
 - `timestampUtc`: UTC timestamp in round-trip ISO-8601 form.
-- `role`: safe role name, `human`, or `system`.
-- `kind`: machine-readable message kind such as `chat.message`, `roles.changed`, `roles.memory.changed`, `roles.deleted`, or `goals.changed`.
+- `role`: safe role name, `human`, `system`, or the reserved tool role `goal`.
+- `kind`: machine-readable message kind such as `chat.message`, `roles.changed`, `roles.memory.changed`, `roles.deleted`, `goals.changed`, `goals.done`, `goals.undone`, or `goals.recheck`.
 - `markdown`: original Markdown content.
 - `changedPaths`: root-relative changed paths, or an empty array.
 
@@ -602,6 +741,8 @@ Rules:
 - Agent-authored updates to that agent's own role memory may be written directly to the filesystem and do not need a `system` message.
 - Goal edits generate a `goals.changed` system message.
 - Goal deletion generates a `goals.changed` system message.
+- `goal done` and `goal undone` append public non-system goal-status messages from the approving or withdrawing role.
+- `goal recheck` generates a `goals.recheck` system message and a regular public `goal` chat message.
 - Agents must obey newly fetched `system` messages before continuing work.
 - Initial no-cursor fetches omit historical `system` messages by default. Current role files, goal files, and role memory are authoritative on join.
 - Agents whose role directory no longer exists must stop working.
@@ -659,6 +800,40 @@ A critical message is machine-checkable:
 
 Historical non-system critical messages remain visible in the initial fetch. Historical `system` messages are filtered from initial no-cursor fetches by default.
 
+## Goal Completion Etiquette
+
+Goals are not considered complete because one role says they are complete. A goal is complete only when every current valid role has publicly marked that goal `done`.
+
+Agents should use:
+
+```powershell
+dotnet simpleagentchat.cs goal done <role> <goal_file_name>
+```
+
+only after that role has actually checked the goal and believes it is complete from that role's responsibility.
+
+Agreement can be withdrawn at any time:
+
+```powershell
+dotnet simpleagentchat.cs goal undone <role> <goal_file_name>
+```
+
+Roles should withdraw agreement if newer chat messages, role changes, goal edits, code changes, review findings, test failures, or other new evidence invalidates the previous completion judgment.
+
+Agents should check completion status before saying a goal is done:
+
+```powershell
+dotnet simpleagentchat.cs goal status <goal_file_name>
+```
+
+When important changes require every role to re-check the goal, any participant may request a recheck:
+
+```powershell
+dotnet simpleagentchat.cs goal recheck <goal_file_name> <reason>
+```
+
+Recheck should be used with care because it resets all current role approvals for the target goal to `undone`. If important changes have been made, though, requesting a recheck is required so stale approvals do not make the goal look complete.
+
 ## Chat Etiquette
 
 These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
@@ -667,6 +842,11 @@ These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
 - Initial no-cursor fetches omit historical `system` messages by default; use current files as the source of truth.
 - Preserve the `nextCursor` returned by initial fetch even when filtered messages are omitted.
 - Read all goals before starting work.
+- Use `goal status <goal_file_name>` before claiming a goal is complete.
+- A goal is complete only when every current valid role has publicly marked it `done`.
+- Use `goal done <role> <goal_file_name>` only after checking the goal from your role's responsibility.
+- Use `goal undone <role> <goal_file_name>` when new evidence invalidates your previous completion agreement.
+- Use `goal recheck <goal_file_name> <reason>` when important changes require every role to re-check and re-approve the goal.
 - Read your assigned role instructions and role memory before speaking or working.
 - Review what your role previously said or attempted, then continue from there.
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
@@ -678,6 +858,7 @@ These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
 - If your role instructions or role memory change because of a newly fetched `system` message, re-read them before continuing.
 - If your role directory is deleted, stop working.
 - Keep role memory concise and update it directly only with durable context that will help future sessions of the same role.
+- Do not use the `goal` role unless you are the tool.
 - Do not use the `human` role unless you are the human.
 - Do not use the `system` role unless you are the tool.
 - All messages are public.
@@ -695,6 +876,7 @@ Required approach:
 - Use retry loops for temporary file locks.
 - Avoid editing existing message files.
 - Sort messages by cursor/id when reading.
+- Write goal status files through temporary files and atomic replacement.
 
 The generated `chat.html` should also be written through a temporary file and atomically replaced.
 
@@ -758,8 +940,8 @@ Endpoint contracts:
 - `DELETE /api/roles/<role>` deletes that role directory and emits a critical `roles.deleted` system message whose Markdown starts with `!`.
 - `GET /api/goals` returns safe goal file names and metadata.
 - `GET /api/goals/<name>` returns `{ "name": "...", "content": "..." }`.
-- `PUT /api/goals/<name>` accepts `{ "content": "..." }`, writes the goal file, and emits a `goals.changed` system message.
-- `DELETE /api/goals/<name>` deletes the goal file and emits a `goals.changed` system message.
+- `PUT /api/goals/<name>` accepts `{ "content": "..." }`, writes the goal file, resets completion status for that goal to `undone` for all current roles, and emits a `goals.changed` system message.
+- `DELETE /api/goals/<name>` deletes the goal file, deletes the goal status file if present, and emits a `goals.changed` system message.
 - `GET /api/assets` returns safe asset file names and metadata.
 - `GET /assets/<name>` serves only a safe file from `.simpleagentchat/assets/`.
 - `PUT /api/assets/<name>` writes raw request bytes to `.simpleagentchat/assets/<name>`.
@@ -818,6 +1000,10 @@ A successful v1 should support:
 - `fetch` returns a `nextCursor` watermark even when messages are filtered from output.
 - `fetch --json` returns the specified JSON schema for messages, timeouts, and errors.
 - `fetch <cursor> <wait-ms>` returns newer messages or waits briefly.
+- `goal done <role> <goal_file_name>` records public completion agreement for that role.
+- `goal undone <role> <goal_file_name>` withdraws that role's completion agreement.
+- `goal status <goal_file_name>` reports status for every current valid role and reports complete only when all are `done`.
+- `goal recheck <goal_file_name> <reason>` resets all current role approvals for the target goal and emits both a system message and a regular public goal message.
 - `chat.html` renders the Markdown chat transcript with roles and timestamps.
 - Deleting a role produces a critical system message telling affected agents to stop.
 - Rejoining agents can determine from fetched history whether `Start` already happened and can resume the role from its previous messages and memory.
