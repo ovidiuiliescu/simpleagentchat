@@ -48,15 +48,14 @@ dotnet simpleagentchat.cs <command>
 
 The tool should not require a `.csproj` file in the host repository.
 
-.NET file-based app builds are cached by source file and SDK inputs. Concurrent instances of the same file-based app can contend for the cached output on Windows when one process is still running. Generated agent instructions should therefore document the safe concurrent command pattern:
+.NET file-based app builds are cached by source file and SDK inputs. Concurrent invocations of the same file-based app can contend for the cached output when one process is still running or another process is building. This is .NET SDK build-cache contention, not contention in simpleagentchat's message files. Generated agent instructions should always tell agents to run the already-built role-local runner because an agent cannot know whether another participant is active until after it runs a command:
 
 ```powershell
-dotnet build .\simpleagentchat.cs
-dotnet run --file .\simpleagentchat.cs --no-build -- fetch --json
-dotnet run --file .\simpleagentchat.cs --no-build -- fetch <cursor> --wait-ms 300000 --json
+dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json
+dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <cursor> --wait-ms 300000 --json
 ```
 
-The `dotnet build` step is only needed to seed or refresh the cache while no `simpleagentchat` process is running. Agents should use the `dotnet run --file ... --no-build -- <command>` form when `serve` or another long-polling command may already be active.
+Role setup owns creating and refreshing `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` and `.simpleagentchat/roles/<role>/runner/`. The role-local source copy gives each role a separate .NET file-based build-cache identity, and agents execute the built DLL rather than asking the SDK to build the root source file. Agents must not manually copy files inside `%TEMP%\dotnet\runfile`.
 
 ## Repository Layout
 
@@ -72,9 +71,13 @@ When initialized, the repository contains:
     implementer/
       instructions.md
       role_memory.md
+      simpleagentchat-implementer.cs
+      runner/
     reviewer/
       instructions.md
       role_memory.md
+      simpleagentchat-reviewer.cs
+      runner/
   state.json
   ui.html
 HOW_TO_CHAT.md
@@ -167,7 +170,9 @@ Rules:
 - Create `.simpleagentchat/goal_status/` if missing.
 - If no valid role directories exist, create the default `implementer` and `reviewer` role directories.
 - For every valid role directory, create `instructions.md` if missing and create `role_memory.md` if missing.
+- For every valid role directory, refresh the role-local source copy at `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` from the root `simpleagentchat.cs`, then build it into `.simpleagentchat/roles/<role>/runner/`.
 - Never overwrite existing role instructions, role memory, goals, goal status files, assets, or message files during initialization.
+- Role-local source copies and runner outputs are generated implementation files and may be refreshed by initialization, role creation, and role rename.
 - Create `.gitignore` if missing.
 - Add `.simpleagentchat/` to `.gitignore` once. Treat existing `.simpleagentchat` and `.simpleagentchat/` entries as already satisfying this requirement.
 - Preserve all existing `.gitignore` content and line endings as much as practical.
@@ -227,6 +232,8 @@ Default roles:
 Each role directory also contains:
 
 - `role_memory.md`: persistent role-specific memory, also called the role's thoughts file, for useful long-term thoughts, decisions, learnings, handoff notes, and context that should survive across agent sessions.
+- `simpleagentchat-<role>.cs`: generated role-local source copy used to give that role an independent .NET file-based build identity.
+- `runner/`: generated role-local build output. Agents always run this DLL for chat commands.
 
 The UI should let the human create, edit, and delete roles.
 
@@ -883,7 +890,7 @@ These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
 - Review what your role previously said or attempted, then continue from there.
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
 - Once you join, always keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen.
-- If no messages are available yet, run a long wait such as `dotnet run --file .\simpleagentchat.cs --no-build -- fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true` when another `simpleagentchat` command may already be running.
+- If no messages are available yet, run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true`.
 - After joining, always fetch from your latest fetched cursor before each meaningful work step.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from messages returned by `fetch`.
 - Critical or blocker messages are prefixed with `!`.
@@ -974,11 +981,11 @@ Endpoint contracts:
 - `GET /api/events` returns a Server-Sent Events stream that notifies browser clients when messages, roles, goals, goal status files, or assets change. The server should watch the chat files so messages written by agent CLI commands refresh the browser UI without manual polling.
 - `POST /api/messages` accepts `{ "markdown": "...", "critical": false }`, writes a `human` message, and returns the created message object plus `nextCursor`. If `critical` is `true` and the trimmed Markdown does not start with `!`, the server prepends `! ` before writing the message.
 - `GET /api/roles` returns role names and metadata for valid role directories.
-- `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, rejects existing roles, and emits a `roles.changed` system message.
+- `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, creates and builds that role's local runner, rejects existing roles, and emits a `roles.changed` system message.
 - `GET /api/roles/<role>` returns `{ "role": "...", "instructions": "...", "memory": "..." }`.
-- `PUT /api/roles/<role>/instructions` accepts `{ "markdown": "..." }`, creates the role directory and default `role_memory.md` if the role does not already exist, writes `instructions.md`, and emits a `roles.changed` system message.
+- `PUT /api/roles/<role>/instructions` accepts `{ "markdown": "..." }`, creates the role directory, default `role_memory.md`, and role-local runner if the role does not already exist, writes `instructions.md`, and emits a `roles.changed` system message.
 - `PUT /api/roles/<role>/memory` accepts `{ "markdown": "..." }`, writes `role_memory.md`, and emits a `roles.memory.changed` system message because the edit came through the human/UI channel.
-- `POST /api/roles/<role>/rename` accepts `{ "role": "new-role" }`, renames the current role, rejects existing target roles, preserves instructions and memory, updates goal status metadata for the renamed role, and emits a `roles.changed` system message.
+- `POST /api/roles/<role>/rename` accepts `{ "role": "new-role" }`, renames the current role, rejects existing target roles, preserves instructions and memory, refreshes and builds the renamed role's local runner, updates goal status metadata for the renamed role, and emits a `roles.changed` system message.
 - `DELETE /api/roles/<role>` deletes that role directory and emits a critical `roles.deleted` system message whose Markdown starts with `!`.
 - `GET /api/goals` returns safe goal file names, metadata, a `complete` flag, and a `status` object containing the current per-role goal status report.
 - `POST /api/goals` accepts `{ "name": "...", "content": "..." }`, creates a new goal, rejects existing goals, resets completion status for all current roles, and emits a `goals.changed` system message.

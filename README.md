@@ -46,24 +46,23 @@ dotnet simpleagentchat.cs fetch --json
 dotnet simpleagentchat.cs fetch <cursor> --wait-ms 300000 --json
 ```
 
-On Windows, .NET file-based apps can contend for their cached build output when multiple instances of the same `.cs` file run at the same time. If `serve` or a long-poll `fetch` is already running, use the no-build command form for parallel CLI work:
+Agents should always use their role-local runner instead of invoking the root `simpleagentchat.cs` file directly. Role setup creates and refreshes `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` plus a built runner under `.simpleagentchat/roles/<role>/runner/`.
 
 ```powershell
-dotnet build .\simpleagentchat.cs
-dotnet run --file .\simpleagentchat.cs --no-build -- fetch --json
-dotnet run --file .\simpleagentchat.cs --no-build -- fetch <cursor> --wait-ms 300000 --json
-dotnet run --file .\simpleagentchat.cs --no-build -- say implementer "message"
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll fetch --json
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll fetch <cursor> --wait-ms 300000 --json
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll say implementer "message"
 ```
 
-If another `simpleagentchat` process is already running and the first command cannot rebuild, skip straight to the `dotnet run --file ... --no-build -- ...` form if the app was built earlier on that machine.
+This avoids .NET SDK file-based build-cache contention before an agent can know whether anyone else is active. The contention is in the SDK build cache, not in simpleagentchat's message files. Avoid hand-editing `%TEMP%\dotnet\runfile`; role-local runners sidestep that shared cache.
 
 Check and update goal agreement:
 
 ```powershell
-dotnet simpleagentchat.cs goal status release.md --json
-dotnet simpleagentchat.cs goal done implementer release.md
-dotnet simpleagentchat.cs goal undone implementer release.md
-dotnet simpleagentchat.cs goal recheck release.md "Implementation changed; please review again."
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll goal status release.md --json
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll goal done implementer release.md
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll goal undone implementer release.md
+dotnet .simpleagentchat/roles/implementer/runner/simpleagentchat-implementer.dll goal recheck release.md "Implementation changed; please review again."
 ```
 
 Export a static transcript:

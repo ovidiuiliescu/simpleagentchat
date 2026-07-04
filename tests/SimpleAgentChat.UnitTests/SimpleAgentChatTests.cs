@@ -145,6 +145,7 @@ internal static class SimpleAgentChatTests
         Directory.CreateDirectory(root);
         try
         {
+            File.WriteAllText(Path.Combine(root, "simpleagentchat.cs"), "Console.WriteLine(\"role runner smoke\");\n");
             var workspace = ChatWorkspace.Initialize(root);
             var roles = workspace.GetRoleNames();
             Assert(roles.SequenceEqual(new[] { "implementer", "reviewer" }), "default roles should be implementer and reviewer");
@@ -153,6 +154,11 @@ internal static class SimpleAgentChatTests
             Assert(reviewerInstructions.Contains("Perform a thorough code review.", StringComparison.Ordinal), "reviewer should ask for a thorough code review");
             Assert(reviewerInstructions.Contains("gaps the implementer may have missed", StringComparison.Ordinal), "reviewer should look for implementer gaps");
             Assert(reviewerInstructions.Contains("ask a question in the chat", StringComparison.Ordinal), "reviewer should ask questions when unclear");
+
+            var reviewerSource = workspace.RoleSourcePath("reviewer");
+            Assert(File.Exists(reviewerSource), "reviewer role source copy should exist");
+            Assert(File.ReadAllText(reviewerSource).Contains("role runner smoke", StringComparison.Ordinal), "reviewer role source should match repo source");
+            Assert(File.Exists(workspace.RoleRunnerDllPath("reviewer")), "reviewer runner DLL should exist");
         }
         finally
         {
@@ -168,10 +174,16 @@ internal static class SimpleAgentChatTests
     private static Task TestHowToChatRequiresListening()
     {
         var block = MarkdownBlocks.HowToChatBlock();
-        Assert(block.Contains("dotnet run --file .\\simpleagentchat.cs --no-build -- <command>", StringComparison.Ordinal), "concurrent-safe command form missing");
-        Assert(block.Contains("dotnet build .\\simpleagentchat.cs", StringComparison.Ordinal), "build cache seed guidance missing");
+        Assert(block.Contains("Always run chat commands through your role-local runner", StringComparison.Ordinal), "role-local runner command guidance missing");
+        Assert(block.Contains("replace it with your assigned role name", StringComparison.Ordinal), "role replacement guidance missing");
+        Assert(block.Contains(".simpleagentchat/roles/<role>/simpleagentchat-<role>.cs", StringComparison.Ordinal), "role source copy guidance missing");
+        Assert(block.Contains(".simpleagentchat/roles/<role>/runner/", StringComparison.Ordinal), "role runner folder guidance missing");
+        Assert(block.Contains("The contention happens in the .NET file-based app build cache, not in simpleagentchat's message files", StringComparison.Ordinal), "cache contention explanation missing");
+        Assert(block.Contains("agents run the already-built DLL", StringComparison.Ordinal), "already-built runner explanation missing");
+        Assert(block.Contains("If your role-local runner is missing", StringComparison.Ordinal), "missing runner stop guidance missing");
+        Assert(block.Contains("Do not repair `%TEMP%\\dotnet\\runfile` by hand", StringComparison.Ordinal), "runfile cache warning missing");
         Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen", StringComparison.Ordinal), "join listening warning missing");
-        Assert(block.Contains("dotnet run --file .\\simpleagentchat.cs --no-build -- fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "long wait fetch example missing");
+        Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "role runner long wait example missing");
         Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
         Assert(block.Contains("until the goal is done or a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
         Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");

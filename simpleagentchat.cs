@@ -879,6 +879,21 @@ internal sealed class ChatWorkspace
         return SafeCombine(RolesDir, role);
     }
 
+    public string RoleSourcePath(string role)
+    {
+        return Path.Combine(RoleDirectory(role), RoleSourceFileName(role));
+    }
+
+    public string RoleRunnerDirectory(string role)
+    {
+        return Path.Combine(RoleDirectory(role), "runner");
+    }
+
+    public string RoleRunnerDllPath(string role)
+    {
+        return Path.Combine(RoleRunnerDirectory(role), Path.GetFileNameWithoutExtension(RoleSourceFileName(role)) + ".dll");
+    }
+
     public string GoalPath(string name)
     {
         if (!NameRules.IsValidGoalOrAssetName(name))
@@ -999,7 +1014,96 @@ internal sealed class ChatWorkspace
         {
             Atomic.WriteText(memoryPath, "# Role Memory\n\nNo durable notes yet.\n");
         }
+
+        var sourceUpdated = EnsureRoleSource(role);
+        EnsureRoleRunner(role, sourceUpdated);
     }
+
+    private bool EnsureRoleSource(string role)
+    {
+        var sourcePath = Path.Combine(Root, "simpleagentchat.cs");
+        if (!File.Exists(sourcePath))
+        {
+            return false;
+        }
+
+        var dir = RoleDirectory(role);
+        var targetPath = RoleSourcePath(role);
+        foreach (var existing in Directory.EnumerateFiles(dir, "simpleagentchat-*.cs"))
+        {
+            if (!string.Equals(Path.GetFullPath(existing), Path.GetFullPath(targetPath), StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(existing);
+            }
+        }
+
+        var source = File.ReadAllText(sourcePath, Encoding.UTF8);
+        if (File.Exists(targetPath) && string.Equals(File.ReadAllText(targetPath, Encoding.UTF8), source, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        Atomic.WriteText(targetPath, source);
+        return true;
+    }
+
+    private void EnsureRoleRunner(string role, bool sourceUpdated)
+    {
+        var sourcePath = RoleSourcePath(role);
+        if (!File.Exists(sourcePath))
+        {
+            return;
+        }
+
+        var runnerDir = RoleRunnerDirectory(role);
+        var runnerDll = RoleRunnerDllPath(role);
+        if (!sourceUpdated && File.Exists(runnerDll))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(runnerDir);
+        using var process = new Process();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        process.StartInfo.ArgumentList.Add("build");
+        process.StartInfo.ArgumentList.Add(sourcePath);
+        process.StartInfo.ArgumentList.Add("--output");
+        process.StartInfo.ArgumentList.Add(runnerDir);
+
+        try
+        {
+            if (!process.Start())
+            {
+                throw CliException.Validation("role_runner_build_failed", $"Could not start dotnet build for role '{role}'.");
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+            {
+                var details = string.Join("\n", new[] { output.Trim(), error.Trim() }.Where(text => text.Length > 0));
+                throw CliException.Validation("role_runner_build_failed", $"Could not build runner for role '{role}'. {details}".TrimEnd());
+            }
+        }
+        catch (CliException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw CliException.Validation("role_runner_build_failed", $"Could not build runner for role '{role}': {ex.Message}");
+        }
+    }
+
+    private static string RoleSourceFileName(string role) => $"simpleagentchat-{role}.cs";
 
     private void EnsureGitIgnore()
     {
@@ -1115,17 +1219,20 @@ The active chat lives in `.simpleagentchat/`.
 
 Command forms:
 
-- Normal solo use: `dotnet simpleagentchat.cs <command> ...`.
-- Concurrent-safe use after the app has been built once: `dotnet run --file .\simpleagentchat.cs --no-build -- <command> ...`.
-- If no build cache exists and no `simpleagentchat` command is currently running, seed it with `dotnet build .\simpleagentchat.cs`.
-- Prefer the concurrent-safe form whenever `serve` or a long-poll `fetch` may already be running, especially on Windows where file-based app rebuilds can contend for the same cached DLL.
+- Always run chat commands through your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json`.
+- Examples below use `reviewer`; replace it with your assigned role name.
+- The room creates and refreshes `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` and `.simpleagentchat/roles/<role>/runner/` when roles are created, renamed, or initialized.
+- If your role-local runner is missing, stop and ask the human to refresh the role setup before joining.
+- Human setup or solo maintenance can still use `dotnet simpleagentchat.cs <command> ...`.
+- The contention happens in the .NET file-based app build cache, not in simpleagentchat's message files: concurrent builds of the same `.cs` file target the same cached DLL. Role-local source copies give each role a separate build-cache identity, and agents run the already-built DLL.
+- Do not repair `%TEMP%\dotnet\runfile` by hand; agents should use the role-local runner.
 
 Before joining as an agent:
 
-- Fetch all prior messages with `dotnet run --file .\simpleagentchat.cs --no-build -- fetch --json` when another `simpleagentchat` command may be running; otherwise `dotnet simpleagentchat.cs fetch --json` is fine.
+- Fetch all prior messages with your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json`.
 - Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
 - Preserve the returned `nextCursor`, even when messages were filtered out.
-- CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen. If no messages are available yet, do not stop; run a long wait such as `dotnet run --file .\simpleagentchat.cs --no-build -- fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
+- CRITICAL: once you join, keep listening for new chat messages until the goal is done or you are explicitly instructed not to listen. If no messages are available yet, do not stop; run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
 - Read all files in `.simpleagentchat/goals/`.
 - Read `.simpleagentchat/roles/<role>/instructions.md`.
 - Read `.simpleagentchat/roles/<role>/role_memory.md`.
@@ -1146,10 +1253,10 @@ During work:
 Goal completion:
 
 - A goal is complete only when every current valid role has publicly marked it done.
-- Use `dotnet simpleagentchat.cs goal status <goal_file_name>` before claiming a goal is complete.
-- Use `dotnet simpleagentchat.cs goal done <role> <goal_file_name>` only after checking the goal from your role's responsibility.
-- Use `dotnet simpleagentchat.cs goal undone <role> <goal_file_name>` when new evidence invalidates previous agreement.
-- Use `dotnet simpleagentchat.cs goal recheck <goal_file_name> <reason>` when important changes require every role to re-check and re-approve.
+- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal status <goal_file_name>` before claiming a goal is complete.
+- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal done <role> <goal_file_name>` only after checking the goal from your role's responsibility.
+- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal undone <role> <goal_file_name>` when new evidence invalidates previous agreement.
+- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal recheck <goal_file_name> <reason>` when important changes require every role to re-check and re-approve.
 
 Roles:
 
@@ -1885,13 +1992,13 @@ internal sealed class LocalServer
         var markdown = GetString(document, "markdown") ?? "";
         _workspace.EnsureRoleFiles(role);
         var path = Path.Combine(_workspace.RoleDirectory(role), "instructions.md");
+        var sourcePath = _workspace.RoleSourcePath(role);
         Atomic.WriteText(path, markdown);
-        var changedPath = RootRelative(path);
         var message = await new MessageStore(_workspace).AppendAsync(
             "system",
             "roles.changed",
             "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { changedPath },
+            new[] { RootRelative(path), RootRelative(sourcePath) },
             30000);
         await WriteJsonAsync(context, 200, new { role, message });
     }
@@ -1914,6 +2021,7 @@ internal sealed class LocalServer
         _workspace.EnsureRoleFiles(role);
         var instructionsPath = Path.Combine(dir, "instructions.md");
         var memoryPath = Path.Combine(dir, "role_memory.md");
+        var sourcePath = _workspace.RoleSourcePath(role);
         var instructions = GetString(document, "instructions");
         var memory = GetString(document, "memory");
         if (instructions is not null)
@@ -1930,7 +2038,7 @@ internal sealed class LocalServer
             "system",
             "roles.changed",
             "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { RootRelative(instructionsPath), RootRelative(memoryPath) },
+            new[] { RootRelative(instructionsPath), RootRelative(memoryPath), RootRelative(sourcePath) },
             30000);
         await WriteJsonAsync(context, 200, new { role, message });
     }
@@ -1968,6 +2076,7 @@ internal sealed class LocalServer
         }
 
         Directory.Move(oldDir, newDir);
+        _workspace.EnsureRoleFiles(newRole);
         UpdateGoalStatusRoleName(role, newRole);
         var message = await new MessageStore(_workspace).AppendAsync(
             "system",
