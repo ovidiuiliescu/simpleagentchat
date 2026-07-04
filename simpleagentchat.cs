@@ -384,7 +384,7 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
                 continue;
             }
 
-            if (token.StartsWith("-", StringComparison.Ordinal))
+            if (token.StartsWith('-'))
             {
                 throw CliException.Usage("usage", $"Unknown option '{token}'.");
             }
@@ -464,7 +464,7 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
                 continue;
             }
 
-            if (token.StartsWith("-", StringComparison.Ordinal))
+            if (token.StartsWith('-'))
             {
                 throw CliException.Usage("usage", $"Unknown option '{token}'.");
             }
@@ -503,7 +503,7 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
                 continue;
             }
 
-            if (token.StartsWith("-", StringComparison.Ordinal))
+            if (token.StartsWith('-'))
             {
                 throw CliException.Usage("usage", $"Unknown option '{token}'.");
             }
@@ -547,7 +547,7 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
 
             if (goal is null)
             {
-                if (token.StartsWith("-", StringComparison.Ordinal))
+                if (token.StartsWith('-'))
                 {
                     throw CliException.Usage("usage", $"Unknown option '{token}'.");
                 }
@@ -672,10 +672,10 @@ internal static partial class NameRules
             return false;
         }
 
-        if (name.StartsWith(".", StringComparison.Ordinal) ||
+        if (name.StartsWith('.') ||
             name.Contains("..", StringComparison.Ordinal) ||
-            name.EndsWith(".", StringComparison.Ordinal) ||
-            name.EndsWith(" ", StringComparison.Ordinal))
+            name.EndsWith('.') ||
+            name.EndsWith(' '))
         {
             return false;
         }
@@ -794,6 +794,8 @@ internal static class RepositoryRoot
 
 internal sealed class ChatWorkspace
 {
+    private static readonly string[] NewlineSeparators = { "\r\n", "\n" };
+
     public string Root { get; }
     public string ChatDir { get; }
     public string AssetsDir { get; }
@@ -952,7 +954,7 @@ internal sealed class ChatWorkspace
             .ToArray();
     }
 
-    public string SafeCombine(string baseDir, string childName)
+    public static string SafeCombine(string baseDir, string childName)
     {
         var baseFull = Path.GetFullPath(baseDir);
         var combined = Path.GetFullPath(Path.Combine(baseFull, childName));
@@ -1003,7 +1005,7 @@ internal sealed class ChatWorkspace
     {
         var content = File.Exists(GitIgnorePath) ? File.ReadAllText(GitIgnorePath, Encoding.UTF8) : "";
         var newline = content.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
-        var hasEntry = content.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+        var hasEntry = content.Split(NewlineSeparators, StringSplitOptions.None)
             .Select(line => line.Trim())
             .Any(line => string.Equals(line, ".simpleagentchat", StringComparison.Ordinal) ||
                          string.Equals(line, ".simpleagentchat/", StringComparison.Ordinal));
@@ -1013,7 +1015,7 @@ internal sealed class ChatWorkspace
         }
 
         var builder = new StringBuilder(content);
-        if (builder.Length > 0 && !content.EndsWith("\n", StringComparison.Ordinal) && !content.EndsWith("\r", StringComparison.Ordinal))
+        if (builder.Length > 0 && !content.EndsWith('\n') && !content.EndsWith('\r'))
         {
             builder.Append(newline);
         }
@@ -1094,7 +1096,7 @@ internal static class MarkedBlock
         }
         else
         {
-            var separator = existing.EndsWith("\n", StringComparison.Ordinal) || existing.EndsWith("\r", StringComparison.Ordinal)
+            var separator = existing.EndsWith('\n') || existing.EndsWith('\r')
                 ? newline
                 : newline + newline;
             updated = existing + separator + block + newline;
@@ -1202,7 +1204,7 @@ internal sealed class GoalStatusStore
             ? $"Role `{role}` marked goal `{goalName}` done."
             : $"Role `{role}` marked goal `{goalName}` undone.";
         var kind = status == "done" ? "goals.done" : "goals.undone";
-        var message = store.NewMessage(role, kind, markdown, new[] { statusPath });
+        var message = MessageStore.NewMessage(role, kind, markdown, new[] { statusPath });
 
         await Retry.WithinAsync(waitMs, async () =>
         {
@@ -1231,12 +1233,12 @@ internal sealed class GoalStatusStore
 
         var store = new MessageStore(_workspace);
         var statusPath = RootRelative(_workspace.GoalStatusPath(goalName));
-        var system = store.NewMessage(
+        var system = MessageStore.NewMessage(
             "system",
             "goals.recheck",
             $"Goals changed. All current roles must re-check and re-approve `{goalName}`.",
             new[] { statusPath, RootRelative(_workspace.GoalPath(goalName)) });
-        var goalMessage = store.NewMessage("goal", "chat.message", reason, Array.Empty<string>());
+        var goalMessage = MessageStore.NewMessage("goal", "chat.message", reason, Array.Empty<string>());
 
         await Retry.WithinAsync(waitMs, async () =>
         {
@@ -1323,7 +1325,7 @@ internal sealed class GoalStatusStore
         }
     }
 
-    private GoalStatusDocument NormalizeDocument(string goalName, GoalStatusDocument document)
+    private static GoalStatusDocument NormalizeDocument(string goalName, GoalStatusDocument document)
     {
         document.Goal = goalName;
         document.Roles ??= new Dictionary<string, RoleStatusEntry>(StringComparer.Ordinal);
@@ -1472,7 +1474,7 @@ internal sealed class LocalServer
         return 0;
     }
 
-    private IReadOnlyList<FileSystemWatcher> StartWatchers()
+    private List<FileSystemWatcher> StartWatchers()
     {
         var watchers = new List<FileSystemWatcher>();
         AddWatcher(_workspace.MessagesDir, "messages", includeSubdirectories: false);
@@ -1520,7 +1522,7 @@ internal sealed class LocalServer
     private static bool ShouldBroadcastFileEvent(string path)
     {
         var name = Path.GetFileName(path);
-        return !string.IsNullOrWhiteSpace(name) && !name.StartsWith(".", StringComparison.Ordinal);
+        return !string.IsNullOrWhiteSpace(name) && !name.StartsWith('.');
     }
 
     private HttpListener StartListener()
@@ -1696,6 +1698,8 @@ internal sealed class LocalServer
             {
                 _eventClients.Remove(client);
             }
+
+            client.Dispose();
         }
     }
 
@@ -1760,7 +1764,7 @@ internal sealed class LocalServer
         using var document = await ReadJsonDocumentAsync(context.Request);
         var markdown = GetString(document, "markdown") ?? "";
         var critical = GetBool(document, "critical") ?? false;
-        if (critical && !markdown.TrimStart().StartsWith("!", StringComparison.Ordinal))
+        if (critical && !markdown.TrimStart().StartsWith('!'))
         {
             markdown = "! " + markdown.TrimStart();
         }
@@ -2092,7 +2096,7 @@ internal sealed class LocalServer
         var goalPath = _workspace.GoalPath(name);
         var statusPath = _workspace.GoalStatusPath(name);
         var store = new MessageStore(_workspace);
-        var message = store.NewMessage(
+        var message = MessageStore.NewMessage(
             "system",
             "goals.changed",
             "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
@@ -2126,7 +2130,7 @@ internal sealed class LocalServer
         var content = GetString(document, "content") ?? "";
         Atomic.WriteText(goalPath, content);
         var store = new MessageStore(_workspace);
-        var message = store.NewMessage(
+        var message = MessageStore.NewMessage(
             "system",
             "goals.changed",
             "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
@@ -2537,10 +2541,11 @@ internal sealed class ApiException : Exception
     }
 }
 
-internal sealed class ServerEventClient
+internal sealed class ServerEventClient : IDisposable
 {
     private readonly StreamWriter _writer;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private bool _disposed;
 
     public ServerEventClient(StreamWriter writer)
     {
@@ -2552,6 +2557,7 @@ internal sealed class ServerEventClient
         await _writeLock.WaitAsync();
         try
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             await _writer.WriteAsync($"id: {id}\n");
             await _writer.WriteAsync($"event: {eventName}\n");
             await _writer.WriteAsync("data: ");
@@ -2563,6 +2569,17 @@ internal sealed class ServerEventClient
         {
             _writeLock.Release();
         }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _writeLock.Dispose();
     }
 }
 
@@ -2602,7 +2619,7 @@ internal sealed class MessageStore
         return message;
     }
 
-    public Message NewMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
+    public static Message NewMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
     {
         if (!NameRules.IsValidMessageRole(role))
         {
@@ -3039,7 +3056,7 @@ internal static class Markdown
                 FlushParagraph();
                 CloseList();
                 var text = trimmed[(headingLevel + 1)..].Trim();
-                html.Append("<h").Append(headingLevel).Append(">")
+                html.Append("<h").Append(headingLevel).Append('>')
                     .Append(Inline(text))
                     .Append("</h").Append(headingLevel).AppendLine(">");
                 continue;
