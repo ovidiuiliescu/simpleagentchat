@@ -1,0 +1,1401 @@
+#if !SIMPLEAGENTCHAT_TEST
+return await SimpleAgentChat.Program.MainAsync(args);
+#endif
+
+#pragma warning disable IL2026, IL3050
+
+namespace SimpleAgentChat
+{
+
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+internal static class Program
+{
+    public static async Task<int> MainAsync(string[] args)
+    {
+        try
+        {
+            if (args.Length == 0)
+            {
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|goal> ...");
+            }
+
+            var command = args[0];
+            var rest = args.Skip(1).ToArray();
+            return command switch
+            {
+                "init" => await Commands.InitAsync(rest),
+                "say" => await Commands.SayAsync(rest),
+                "fetch" => await Commands.FetchAsync(rest),
+                "goal" => await Commands.GoalAsync(rest),
+                "serve" => await Commands.ServeAsync(rest),
+                _ => throw CliException.Usage("unknown_command", $"Unknown command '{command}'.")
+            };
+        }
+        catch (CliException ex)
+        {
+            ErrorWriter.Write(ex);
+            return ex.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            ErrorWriter.Write(new CliException(1, "unexpected_error", ex.Message));
+            return 1;
+        }
+    }
+}
+
+internal static class Commands
+{
+    public static Task<int> InitAsync(string[] args)
+    {
+        if (args.Length != 0)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs init");
+        }
+
+        var root = RepositoryRoot.FindRequired();
+        ChatWorkspace.Initialize(root);
+        return Task.FromResult(0);
+    }
+
+    public static async Task<int> SayAsync(string[] args)
+    {
+        var parsed = SayArgs.Parse(args);
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+
+        if (!NameRules.IsValidRoleName(parsed.Role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role is not a valid current agent role name.");
+        }
+
+        var roleDir = workspace.RoleDirectory(parsed.Role);
+        if (!Directory.Exists(roleDir))
+        {
+            throw CliException.Validation("missing_role", $"Role '{parsed.Role}' does not exist.");
+        }
+
+        var markdown = await parsed.ReadMarkdownAsync();
+        var store = new MessageStore(workspace);
+        var message = await store.AppendAsync(parsed.Role, "chat.message", markdown, Array.Empty<string>(), parsed.WaitMs);
+        Console.Out.WriteLine(message.Id);
+        return 0;
+    }
+
+    public static async Task<int> FetchAsync(string[] args)
+    {
+        var parsed = FetchArgs.Parse(args);
+        ErrorWriter.JsonMode = parsed.Json;
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+        var store = new MessageStore(workspace);
+        var response = await store.FetchAsync(parsed.Cursor, parsed.IncludeSystem, parsed.WaitMs);
+
+        if (parsed.Json)
+        {
+            Console.Out.WriteLine(Json.Text(response));
+        }
+        else
+        {
+            PlainText.WriteFetch(response);
+        }
+
+        return 0;
+    }
+
+    public static async Task<int> GoalAsync(string[] args)
+    {
+        throw CliException.Usage("not_implemented", "The goal command is implemented in a later slice.");
+    }
+
+    public static async Task<int> ServeAsync(string[] args)
+    {
+        throw new CliException(3, "not_implemented", "The serve command is implemented in a later slice.");
+    }
+}
+
+internal sealed class CliException : Exception
+{
+    public int ExitCode { get; }
+    public string Code { get; }
+
+    public CliException(int exitCode, string code, string message)
+        : base(message)
+    {
+        ExitCode = exitCode;
+        Code = code;
+    }
+
+    public static CliException Usage(string code, string message) => new(1, code, message);
+    public static CliException Validation(string code, string message) => new(1, code, message);
+    public static CliException LockTimeout(string message) => new(2, "lock_timeout", message);
+    public static CliException ServerStartup(string message) => new(3, "server_startup", message);
+}
+
+internal static class ErrorWriter
+{
+    public static bool JsonMode { get; set; }
+
+    public static void Write(CliException ex)
+    {
+        if (JsonMode)
+        {
+            var body = new
+            {
+                error = new
+                {
+                    code = ex.Code,
+                    message = ex.Message
+                }
+            };
+            Console.Error.WriteLine(Json.Text(body));
+        }
+        else
+        {
+            Console.Error.WriteLine(ex.Message);
+        }
+    }
+}
+
+internal sealed record SayArgs(string Role, int WaitMs, string? InlineMarkdown, bool UseStdin, string? FilePath)
+{
+    public static SayArgs Parse(string[] args)
+    {
+        if (args.Length < 1)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs say <role> [--wait-ms <ms>] <markdown>|--stdin|--file <path>");
+        }
+
+        var role = args[0];
+        var waitMs = 30000;
+        string? inline = null;
+        string? file = null;
+        var stdin = false;
+        var i = 1;
+        var markdownStarted = false;
+
+        while (i < args.Length)
+        {
+            var token = args[i];
+            if (!markdownStarted && token == "--")
+            {
+                inline = string.Join(" ", args.Skip(i + 1));
+                markdownStarted = true;
+                break;
+            }
+
+            if (!markdownStarted && token == "--wait-ms")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw CliException.Usage("usage", "--wait-ms requires a value.");
+                }
+
+                waitMs = ParseWaitMs(args[i + 1]);
+                i += 2;
+                continue;
+            }
+
+            if (!markdownStarted && token == "--stdin")
+            {
+                stdin = true;
+                i++;
+                continue;
+            }
+
+            if (!markdownStarted && token == "--file")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw CliException.Usage("usage", "--file requires a path.");
+                }
+
+                file = args[i + 1];
+                i += 2;
+                continue;
+            }
+
+            inline = string.Join(" ", args.Skip(i));
+            markdownStarted = true;
+            break;
+        }
+
+        var sources = 0;
+        if (inline is not null) sources++;
+        if (stdin) sources++;
+        if (file is not null) sources++;
+        if (sources != 1)
+        {
+            throw CliException.Usage("usage", "Exactly one of inline Markdown, --stdin, or --file is required.");
+        }
+
+        return new SayArgs(role, waitMs, inline, stdin, file);
+    }
+
+    public async Task<string> ReadMarkdownAsync()
+    {
+        if (UseStdin)
+        {
+            return await Console.In.ReadToEndAsync();
+        }
+
+        if (FilePath is not null)
+        {
+            try
+            {
+                return await File.ReadAllTextAsync(FilePath, Encoding.UTF8);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                throw CliException.Validation("unreadable_file", $"Could not read --file path: {ex.Message}");
+            }
+        }
+
+        return InlineMarkdown ?? "";
+    }
+
+    private static int ParseWaitMs(string value)
+    {
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var waitMs) || waitMs < 0)
+        {
+            throw CliException.Validation("invalid_wait_ms", "wait-ms must be an integer from 0 through 2147483647.");
+        }
+
+        return waitMs;
+    }
+}
+
+internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool IncludeSystem)
+{
+    public static FetchArgs Parse(string[] args)
+    {
+        string? cursor = null;
+        int? waitMs = null;
+        int? positionalWaitMs = null;
+        var json = false;
+        bool? includeSystem = null;
+        var positionals = new List<string>();
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token == "--json")
+            {
+                json = true;
+                continue;
+            }
+
+            if (token == "--include-system")
+            {
+                includeSystem = true;
+                continue;
+            }
+
+            if (token == "--wait-ms")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    throw CliException.Usage("usage", "--wait-ms requires a value.");
+                }
+
+                waitMs = ParseWaitMs(args[++i]);
+                continue;
+            }
+
+            if (token.StartsWith("-", StringComparison.Ordinal))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            positionals.Add(token);
+        }
+
+        if (positionals.Count > 2)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs fetch [cursor [wait-ms]] [--wait-ms <ms>] [--json] [--include-system]");
+        }
+
+        if (positionals.Count >= 1)
+        {
+            cursor = positionals[0];
+            if (!NameRules.IsValidMessageId(cursor))
+            {
+                throw CliException.Validation("invalid_cursor", "Cursor is not a valid simpleagentchat message id.");
+            }
+        }
+
+        if (positionals.Count == 2)
+        {
+            positionalWaitMs = ParseWaitMs(positionals[1]);
+        }
+
+        if (waitMs.HasValue && positionalWaitMs.HasValue)
+        {
+            throw CliException.Usage("usage", "wait-ms cannot be supplied both positionally and with --wait-ms.");
+        }
+
+        var finalWaitMs = waitMs ?? positionalWaitMs ?? 30000;
+        var finalIncludeSystem = includeSystem ?? (cursor is not null);
+        return new FetchArgs(cursor, finalWaitMs, json, finalIncludeSystem);
+    }
+
+    private static int ParseWaitMs(string value)
+    {
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var waitMs) || waitMs < 0)
+        {
+            throw CliException.Validation("invalid_wait_ms", "wait-ms must be an integer from 0 through 2147483647.");
+        }
+
+        return waitMs;
+    }
+}
+
+internal static partial class NameRules
+{
+    private static readonly Regex RoleRegex = new("^[a-z][a-z0-9_-]{0,63}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex FileNameRegex = new("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex MessageIdRegex = new("^\\d{8}T\\d{6}\\.\\d{7}Z-[a-z][a-z0-9_-]{0,63}-[a-f0-9]{6,16}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly HashSet<string> ReservedRoles = new(StringComparer.OrdinalIgnoreCase) { "goal", "human", "system" };
+    private static readonly HashSet<string> WindowsDevices = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
+
+    public static bool IsValidRoleName(string? role, bool allowReserved)
+    {
+        if (string.IsNullOrWhiteSpace(role) || !RoleRegex.IsMatch(role))
+        {
+            return false;
+        }
+
+        if (!allowReserved && ReservedRoles.Contains(role))
+        {
+            return false;
+        }
+
+        return !IsWindowsDeviceName(role);
+    }
+
+    public static bool IsValidMessageRole(string? role)
+    {
+        return role is "human" or "system" or "goal" || IsValidRoleName(role, allowReserved: false);
+    }
+
+    public static bool IsValidGoalOrAssetName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        if (!FileNameRegex.IsMatch(name))
+        {
+            return false;
+        }
+
+        if (name.StartsWith(".", StringComparison.Ordinal) ||
+            name.Contains("..", StringComparison.Ordinal) ||
+            name.EndsWith(".", StringComparison.Ordinal) ||
+            name.EndsWith(" ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (name.Contains('/', StringComparison.Ordinal) ||
+            name.Contains('\\', StringComparison.Ordinal) ||
+            name.Contains(':', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (name.Contains("%2f", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("%5c", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        foreach (var ch in name)
+        {
+            if (char.IsControl(ch))
+            {
+                return false;
+            }
+        }
+
+        return !IsWindowsDeviceName(name);
+    }
+
+    public static bool IsValidMessageId(string? id) => id is not null && MessageIdRegex.IsMatch(id);
+
+    private static bool IsWindowsDeviceName(string value)
+    {
+        var baseName = value;
+        var dotIndex = value.IndexOf('.');
+        if (dotIndex >= 0)
+        {
+            baseName = value[..dotIndex];
+        }
+
+        return WindowsDevices.Contains(baseName);
+    }
+}
+
+internal static class RepositoryRoot
+{
+    public static string FindRequired()
+    {
+        var gitRoot = TryGitRoot();
+        if (gitRoot is not null)
+        {
+            return gitRoot;
+        }
+
+        var fallback = WalkForGitDirectory(Environment.CurrentDirectory);
+        if (fallback is not null)
+        {
+            return fallback;
+        }
+
+        throw CliException.Validation("not_git_repository", "No Git repository root found. simpleagentchat v1 only initializes inside a Git repository.");
+    }
+
+    private static string? TryGitRoot()
+    {
+        try
+        {
+            using var process = new Process();
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "rev-parse --show-toplevel",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            if (!process.Start())
+            {
+                return null;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(5000);
+            if (process.ExitCode != 0)
+            {
+                return null;
+            }
+
+            var path = output.Trim();
+            return string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? WalkForGitDirectory(string start)
+    {
+        var current = new DirectoryInfo(Path.GetFullPath(start));
+        while (current is not null)
+        {
+            var gitDir = Path.Combine(current.FullName, ".git");
+            if (Directory.Exists(gitDir) || File.Exists(gitDir))
+            {
+                return current.FullName;
+            }
+
+            current = current.Parent;
+        }
+
+        return null;
+    }
+}
+
+internal sealed class ChatWorkspace
+{
+    public string Root { get; }
+    public string ChatDir { get; }
+    public string AssetsDir { get; }
+    public string GoalsDir { get; }
+    public string GoalStatusDir { get; }
+    public string MessagesDir { get; }
+    public string RolesDir { get; }
+    public string StatePath { get; }
+    public string ChatHtmlPath { get; }
+    public string UiHtmlPath { get; }
+    public string GitIgnorePath { get; }
+    public string HowToChatPath { get; }
+    public string AgentsPath { get; }
+
+    private ChatWorkspace(string root)
+    {
+        Root = Path.GetFullPath(root);
+        ChatDir = Path.Combine(Root, ".simpleagentchat");
+        AssetsDir = Path.Combine(ChatDir, "assets");
+        GoalsDir = Path.Combine(ChatDir, "goals");
+        GoalStatusDir = Path.Combine(ChatDir, "goal_status");
+        MessagesDir = Path.Combine(ChatDir, "messages");
+        RolesDir = Path.Combine(ChatDir, "roles");
+        StatePath = Path.Combine(ChatDir, "state.json");
+        ChatHtmlPath = Path.Combine(ChatDir, "chat.html");
+        UiHtmlPath = Path.Combine(ChatDir, "ui.html");
+        GitIgnorePath = Path.Combine(Root, ".gitignore");
+        HowToChatPath = Path.Combine(Root, "HOW_TO_CHAT.md");
+        AgentsPath = Path.Combine(Root, "AGENTS.md");
+    }
+
+    public static ChatWorkspace Initialize(string root)
+    {
+        var workspace = new ChatWorkspace(root);
+        workspace.EnsureWithinRoot();
+        Directory.CreateDirectory(workspace.ChatDir);
+        Directory.CreateDirectory(workspace.AssetsDir);
+        Directory.CreateDirectory(workspace.GoalsDir);
+        Directory.CreateDirectory(workspace.GoalStatusDir);
+        Directory.CreateDirectory(workspace.MessagesDir);
+        Directory.CreateDirectory(workspace.RolesDir);
+
+        var validRoles = workspace.GetRoleNames().ToArray();
+        if (validRoles.Length == 0)
+        {
+            workspace.CreateDefaultRole("implementer");
+            workspace.CreateDefaultRole("reviewer");
+        }
+
+        foreach (var role in workspace.GetRoleNames())
+        {
+            workspace.EnsureRoleFiles(role);
+        }
+
+        workspace.EnsureGitIgnore();
+        workspace.EnsureInstructionFiles();
+        workspace.EnsureStateFile();
+        HtmlViews.WriteUiShell(workspace);
+        HtmlViews.RegenerateChat(workspace);
+        return workspace;
+    }
+
+    public static ChatWorkspace OpenExisting(string root)
+    {
+        var workspace = new ChatWorkspace(root);
+        workspace.EnsureWithinRoot();
+        if (!Directory.Exists(workspace.ChatDir))
+        {
+            throw CliException.Validation("not_initialized", "simpleagentchat is not initialized. Run 'dotnet simpleagentchat.cs init' first.");
+        }
+
+        return workspace;
+    }
+
+    public string RoleDirectory(string role)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        return SafeCombine(RolesDir, role);
+    }
+
+    public string GoalPath(string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        return SafeCombine(GoalsDir, name);
+    }
+
+    public string GoalStatusPath(string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        return SafeCombine(GoalStatusDir, name + ".status.json");
+    }
+
+    public string AssetPath(string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
+        }
+
+        return SafeCombine(AssetsDir, name);
+    }
+
+    public IReadOnlyList<string> GetRoleNames()
+    {
+        if (!Directory.Exists(RolesDir))
+        {
+            return Array.Empty<string>();
+        }
+
+        return Directory.EnumerateDirectories(RolesDir)
+            .Select(Path.GetFileName)
+            .Where(name => NameRules.IsValidRoleName(name, allowReserved: false))
+            .Cast<string>()
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    public IReadOnlyList<string> GetGoalNames()
+    {
+        if (!Directory.Exists(GoalsDir))
+        {
+            return Array.Empty<string>();
+        }
+
+        return Directory.EnumerateFiles(GoalsDir)
+            .Select(Path.GetFileName)
+            .Where(NameRules.IsValidGoalOrAssetName)
+            .Cast<string>()
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    public IReadOnlyList<string> GetAssetNames()
+    {
+        if (!Directory.Exists(AssetsDir))
+        {
+            return Array.Empty<string>();
+        }
+
+        return Directory.EnumerateFiles(AssetsDir)
+            .Select(Path.GetFileName)
+            .Where(NameRules.IsValidGoalOrAssetName)
+            .Cast<string>()
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    public string SafeCombine(string baseDir, string childName)
+    {
+        var baseFull = Path.GetFullPath(baseDir);
+        var combined = Path.GetFullPath(Path.Combine(baseFull, childName));
+        if (!PathSafety.IsUnderDirectory(combined, baseFull))
+        {
+            throw CliException.Validation("unsafe_path", "Resolved path escapes the allowed simpleagentchat directory.");
+        }
+
+        return combined;
+    }
+
+    private void EnsureWithinRoot()
+    {
+        foreach (var path in new[] { ChatDir, GitIgnorePath, HowToChatPath, AgentsPath })
+        {
+            if (!PathSafety.IsUnderDirectory(Path.GetFullPath(path), Root, allowEqual: false) &&
+                !string.Equals(Path.GetFullPath(path), Path.GetFullPath(Path.Combine(Root, Path.GetFileName(path))), StringComparison.OrdinalIgnoreCase))
+            {
+                throw CliException.Validation("unsafe_path", "A managed path resolved outside the repository root.");
+            }
+        }
+    }
+
+    private void CreateDefaultRole(string role)
+    {
+        Directory.CreateDirectory(RoleDirectory(role));
+        EnsureRoleFiles(role);
+    }
+
+    public void EnsureRoleFiles(string role)
+    {
+        var dir = RoleDirectory(role);
+        Directory.CreateDirectory(dir);
+        var instructionsPath = Path.Combine(dir, "instructions.md");
+        var memoryPath = Path.Combine(dir, "role_memory.md");
+        if (!File.Exists(instructionsPath))
+        {
+            Atomic.WriteText(instructionsPath, DefaultRoleInstructions(role));
+        }
+
+        if (!File.Exists(memoryPath))
+        {
+            Atomic.WriteText(memoryPath, "# Role Memory\n\nNo durable notes yet.\n");
+        }
+    }
+
+    private void EnsureGitIgnore()
+    {
+        var content = File.Exists(GitIgnorePath) ? File.ReadAllText(GitIgnorePath, Encoding.UTF8) : "";
+        var newline = content.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var hasEntry = content.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+            .Select(line => line.Trim())
+            .Any(line => string.Equals(line, ".simpleagentchat", StringComparison.Ordinal) ||
+                         string.Equals(line, ".simpleagentchat/", StringComparison.Ordinal));
+        if (hasEntry)
+        {
+            return;
+        }
+
+        var builder = new StringBuilder(content);
+        if (builder.Length > 0 && !content.EndsWith("\n", StringComparison.Ordinal) && !content.EndsWith("\r", StringComparison.Ordinal))
+        {
+            builder.Append(newline);
+        }
+
+        builder.Append(".simpleagentchat/").Append(newline);
+        Atomic.WriteText(GitIgnorePath, builder.ToString());
+    }
+
+    private void EnsureInstructionFiles()
+    {
+        var howBlock = MarkdownBlocks.HowToChatBlock();
+        MarkedBlock.Upsert(HowToChatPath, howBlock);
+        var agentsBlock = "If you are asked to join a simpleagentchat chat, read HOW_TO_CHAT.md first and follow it.\n";
+        MarkedBlock.Upsert(AgentsPath, agentsBlock);
+    }
+
+    private void EnsureStateFile()
+    {
+        if (File.Exists(StatePath))
+        {
+            return;
+        }
+
+        var state = new
+        {
+            schemaVersion = 1,
+            initializedAtUtc = Time.UtcNowRoundTrip()
+        };
+        Atomic.WriteText(StatePath, Json.Text(state) + "\n");
+    }
+
+    private static string DefaultRoleInstructions(string role) => role switch
+    {
+        "implementer" => "# Implementer Role\n\nImplement the goal cleanly and efficiently. Prefer pragmatic DRY and YAGNI. Fetch before meaningful work, read current goals and role memory, and wait for a human `Start` unless one already appears in fetched history.\n",
+        "reviewer" => "# Reviewer Role\n\nReview work for correctness, risks, regressions, missing tests, and clarity. Fetch before meaningful review, read current goals and role memory, and mark goals done only after checking the implementation from this role's responsibility.\n",
+        _ => $"# {role} Role\n\nFollow HOW_TO_CHAT.md. Read this file, role_memory.md, and current goals before participating.\n"
+    };
+}
+
+internal static class PathSafety
+{
+    public static bool IsUnderDirectory(string path, string directory, bool allowEqual = true)
+    {
+        var pathFull = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var dirFull = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (allowEqual && string.Equals(pathFull, dirFull, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return pathFull.StartsWith(dirFull + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+               pathFull.StartsWith(dirFull + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+internal static class MarkedBlock
+{
+    private const string Start = "<!-- simpleagentchat:start -->";
+    private const string End = "<!-- simpleagentchat:end -->";
+
+    public static void Upsert(string path, string blockContent)
+    {
+        var existing = File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : "";
+        var newline = existing.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var normalizedBlock = blockContent.Replace("\r\n", "\n", StringComparison.Ordinal).Replace("\n", newline, StringComparison.Ordinal);
+        var block = Start + newline + normalizedBlock.TrimEnd('\r', '\n') + newline + End;
+
+        var startIndex = existing.IndexOf(Start, StringComparison.Ordinal);
+        var endIndex = existing.IndexOf(End, StringComparison.Ordinal);
+        string updated;
+        if (startIndex >= 0 && endIndex > startIndex)
+        {
+            updated = existing[..startIndex] + block + existing[(endIndex + End.Length)..];
+        }
+        else if (string.IsNullOrEmpty(existing))
+        {
+            updated = block + newline;
+        }
+        else
+        {
+            var separator = existing.EndsWith("\n", StringComparison.Ordinal) || existing.EndsWith("\r", StringComparison.Ordinal)
+                ? newline
+                : newline + newline;
+            updated = existing + separator + block + newline;
+        }
+
+        Atomic.WriteText(path, updated);
+    }
+}
+
+internal static class MarkdownBlocks
+{
+    public static string HowToChatBlock() => """
+# simpleagentchat
+
+The active chat lives in `.simpleagentchat/`.
+
+Before joining as an agent:
+
+- Fetch all prior messages with `dotnet simpleagentchat.cs fetch --json`.
+- Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
+- Preserve the returned `nextCursor`, even when messages were filtered out.
+- Read all files in `.simpleagentchat/goals/`.
+- Read `.simpleagentchat/roles/<role>/instructions.md`.
+- Read `.simpleagentchat/roles/<role>/role_memory.md`.
+- Review prior non-system messages from your role and continue from where that role left off.
+- Do not begin implementation work until a human message exactly says `Start`, unless a previous fetched human `Start` already exists.
+
+During work:
+
+- Fetch from your latest fetched cursor before each meaningful step.
+- Do not advance your fetch cursor from your own `say` result. Advance it only from `fetch`.
+- Obey critical messages that start with `!` immediately.
+- Obey newly fetched `system` messages immediately.
+- Re-read role instructions, role memory, and goals when instructed.
+- Stop if your role directory no longer exists.
+- Put assets in `.simpleagentchat/assets/` before referencing them.
+
+Goal completion:
+
+- A goal is complete only when every current valid role has publicly marked it done.
+- Use `dotnet simpleagentchat.cs goal status <goal_file_name>` before claiming a goal is complete.
+- Use `dotnet simpleagentchat.cs goal done <role> <goal_file_name>` only after checking the goal from your role's responsibility.
+- Use `dotnet simpleagentchat.cs goal undone <role> <goal_file_name>` when new evidence invalidates previous agreement.
+- Use `dotnet simpleagentchat.cs goal recheck <goal_file_name> <reason>` when important changes require every role to re-check and re-approve.
+
+Roles:
+
+- Do not use the `goal` role unless you are the tool.
+- Do not use the `human` role unless you are the human.
+- Do not use the `system` role unless you are the tool.
+- All chat is public.
+""";
+}
+
+internal sealed class MessageStore
+{
+    private readonly ChatWorkspace _workspace;
+    private static readonly object ClockLock = new();
+    private static DateTimeOffset _lastTimestamp = DateTimeOffset.MinValue;
+
+    public MessageStore(ChatWorkspace workspace)
+    {
+        _workspace = workspace;
+    }
+
+    public async Task<Message> AppendAsync(string role, string kind, string markdown, IReadOnlyList<string> changedPaths, int waitMs)
+    {
+        if (!NameRules.IsValidMessageRole(role))
+        {
+            throw CliException.Validation("invalid_role", "Message role is not valid.");
+        }
+
+        var message = CreateMessage(role, kind, markdown, changedPaths);
+        await Retry.WithinAsync(waitMs, async () =>
+        {
+            Directory.CreateDirectory(_workspace.MessagesDir);
+            var finalPath = Path.Combine(_workspace.MessagesDir, message.Id + ".json");
+            var tempPath = Path.Combine(_workspace.MessagesDir, "." + message.Id + "." + Guid.NewGuid().ToString("N") + ".tmp");
+            await Atomic.WriteTextAsync(tempPath, Json.Text(message) + "\n");
+            try
+            {
+                File.Move(tempPath, finalPath, overwrite: false);
+            }
+            catch
+            {
+                File.Delete(tempPath);
+                throw;
+            }
+
+            HtmlViews.RegenerateChat(_workspace);
+        });
+        return message;
+    }
+
+    public async Task<FetchResponse> FetchAsync(string? cursor, bool includeSystem, int waitMs)
+    {
+        if (cursor is not null && !NameRules.IsValidMessageId(cursor))
+        {
+            throw CliException.Validation("invalid_cursor", "Cursor is not a valid simpleagentchat message id.");
+        }
+
+        var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
+        while (true)
+        {
+            var allMessages = ReadAllMessages();
+            var newest = allMessages.Count == 0 ? null : allMessages[^1].Id;
+            var newer = cursor is null
+                ? allMessages
+                : allMessages.Where(m => string.CompareOrdinal(m.Id, cursor) > 0).ToList();
+            var filtered = includeSystem ? newer : newer.Where(m => m.Role != "system").ToList();
+
+            if (filtered.Count > 0 || (newer.Count > 0 && filtered.Count == 0) || waitMs == 0 || DateTime.UtcNow >= deadline)
+            {
+                var timedOut = filtered.Count == 0 && newer.Count == 0;
+                return new FetchResponse(newest, timedOut, filtered);
+            }
+
+            await Task.Delay(Math.Min(200, Math.Max(10, waitMs)));
+        }
+    }
+
+    public List<Message> ReadAllMessages()
+    {
+        if (!Directory.Exists(_workspace.MessagesDir))
+        {
+            return new List<Message>();
+        }
+
+        var messages = new List<Message>();
+        foreach (var file in Directory.EnumerateFiles(_workspace.MessagesDir, "*.json").Order(StringComparer.Ordinal))
+        {
+            var id = Path.GetFileNameWithoutExtension(file);
+            if (!NameRules.IsValidMessageId(id))
+            {
+                continue;
+            }
+
+            try
+            {
+                var message = JsonSerializer.Deserialize<Message>(File.ReadAllText(file, Encoding.UTF8), Json.Options);
+                if (message is not null && message.Id == id && NameRules.IsValidMessageRole(message.Role))
+                {
+                    messages.Add(message);
+                }
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+        }
+
+        messages.Sort((a, b) => string.CompareOrdinal(a.Id, b.Id));
+        return messages;
+    }
+
+    private static Message CreateMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
+    {
+        var timestamp = NextTimestamp();
+        var random = Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant();
+        var id = timestamp.ToString("yyyyMMdd'T'HHmmss.fffffff'Z'", CultureInfo.InvariantCulture) + "-" + role + "-" + random;
+        return new Message(id, Time.RoundTrip(timestamp), role, kind, markdown, changedPaths.ToArray());
+    }
+
+    private static DateTimeOffset NextTimestamp()
+    {
+        lock (ClockLock)
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (now <= _lastTimestamp)
+            {
+                now = _lastTimestamp.AddTicks(1);
+            }
+
+            _lastTimestamp = now;
+            return now;
+        }
+    }
+}
+
+internal sealed record Message(
+    string Id,
+    string TimestampUtc,
+    string Role,
+    string Kind,
+    string Markdown,
+    string[] ChangedPaths);
+
+internal sealed record FetchResponse(
+    string? NextCursor,
+    bool TimedOut,
+    IReadOnlyList<Message> Messages);
+
+internal static class PlainText
+{
+    public static void WriteFetch(FetchResponse response)
+    {
+        Console.Out.WriteLine($"nextCursor: {response.NextCursor ?? "null"}");
+        Console.Out.WriteLine($"timedOut: {response.TimedOut.ToString().ToLowerInvariant()}");
+        Console.Out.WriteLine($"messageCount: {response.Messages.Count}");
+        foreach (var message in response.Messages)
+        {
+            Console.Out.WriteLine();
+            Console.Out.WriteLine($"--- message {message.Id}");
+            Console.Out.WriteLine($"timestampUtc: {message.TimestampUtc}");
+            Console.Out.WriteLine($"role: {message.Role}");
+            Console.Out.WriteLine($"kind: {message.Kind}");
+            Console.Out.WriteLine("markdown:");
+            Console.Out.WriteLine(message.Markdown);
+            Console.Out.WriteLine("--- end");
+        }
+    }
+}
+
+internal static class HtmlViews
+{
+    public static void RegenerateChat(ChatWorkspace workspace)
+    {
+        var store = new MessageStore(workspace);
+        var messages = store.ReadAllMessages();
+        var builder = new StringBuilder();
+        builder.AppendLine("<!doctype html>");
+        builder.AppendLine("<html lang=\"en\">");
+        builder.AppendLine("<head>");
+        builder.AppendLine("<meta charset=\"utf-8\">");
+        builder.AppendLine("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+        builder.AppendLine("<meta http-equiv=\"refresh\" content=\"5\">");
+        builder.AppendLine("<title>simpleagentchat transcript</title>");
+        builder.AppendLine("<style>");
+        builder.AppendLine("body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f7f7f4;color:#1d1d1f}main{max-width:980px;margin:0 auto;padding:24px}.message{border-top:1px solid #d8d8d2;padding:16px 0}.meta{font-size:12px;color:#5f6368;display:flex;gap:10px;flex-wrap:wrap}.role{font-weight:700;color:#1b4d3e}.system .role{color:#8a4600}.human .role{color:#164c86}.goal .role{color:#6f3d91}.markdown{line-height:1.55}.markdown pre{background:#202124;color:#f5f5f5;padding:12px;overflow:auto}.markdown code{background:#ededdf;padding:1px 4px;border-radius:3px}.markdown pre code{background:transparent;padding:0}.empty{color:#5f6368}</style>");
+        builder.AppendLine("</head>");
+        builder.AppendLine("<body><main>");
+        builder.AppendLine("<h1>simpleagentchat transcript</h1>");
+        if (messages.Count == 0)
+        {
+            builder.AppendLine("<p class=\"empty\">No messages yet.</p>");
+        }
+        else
+        {
+            foreach (var message in messages)
+            {
+                var classes = "message " + HtmlAttribute(message.Role);
+                builder.Append("<article class=\"").Append(classes).AppendLine("\">");
+                builder.Append("<div class=\"meta\"><span class=\"role\">").Append(Html(message.Role)).Append("</span><span>").Append(Html(message.TimestampUtc)).Append("</span><span>").Append(Html(message.Kind)).Append("</span><span>").Append(Html(message.Id)).AppendLine("</span></div>");
+                builder.Append("<div class=\"markdown\">").Append(Markdown.ToHtml(message.Markdown)).AppendLine("</div>");
+                builder.AppendLine("</article>");
+            }
+        }
+
+        builder.AppendLine("</main></body></html>");
+        Atomic.WriteText(workspace.ChatHtmlPath, builder.ToString());
+    }
+
+    public static void WriteUiShell(ChatWorkspace workspace)
+    {
+        Atomic.WriteText(workspace.UiHtmlPath, UiShell.Html);
+    }
+
+    private static string Html(string value) => WebUtility.HtmlEncode(value);
+    private static string HtmlAttribute(string value) => Regex.Replace(value, "[^a-zA-Z0-9_-]", "-");
+}
+
+internal static class UiShell
+{
+    public const string Html = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simpleagentchat</title>
+<style>
+:root{color-scheme:light;--bg:#f7f7f4;--panel:#ffffff;--line:#d8d8d2;--text:#1d1d1f;--muted:#5f6368;--accent:#1b6f5c;--danger:#a83a32}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,sans-serif}
+header{position:sticky;top:0;z-index:2;background:#fffffff2;border-bottom:1px solid var(--line);padding:12px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+h1{font-size:18px;margin:0}
+main{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(320px,.9fr);gap:16px;padding:16px;max-width:1380px;margin:0 auto}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0}
+section h2{font-size:15px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line)}
+.body{padding:12px 14px}
+textarea,input,select{width:100%;border:1px solid var(--line);border-radius:6px;padding:9px;font:inherit;background:#fff;color:var(--text)}
+textarea{min-height:120px;resize:vertical}
+button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:8px 10px;font:inherit;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row>*{flex:1}
+.row button,.row input[type=checkbox]{flex:0 0 auto}
+.tabs{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tabs button[aria-selected=true]{background:#173d36;color:#fff;border-color:#173d36}
+iframe{width:100%;height:62vh;border:0;border-bottom:1px solid var(--line);background:#fff}
+.list{display:grid;gap:6px;margin:8px 0}
+.item{display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:8px;background:#fff}
+.muted{color:var(--muted);font-size:13px}
+.stack{display:grid;gap:10px}
+@media(max-width:900px){main{grid-template-columns:1fr}iframe{height:52vh}}
+</style>
+</head>
+<body>
+<header><h1>simpleagentchat</h1><span class="muted" id="status">Ready</span></header>
+<main>
+<section>
+<h2>Chat</h2>
+<iframe id="chatFrame" src="/chat.html" title="Chat transcript"></iframe>
+<div class="body stack">
+<textarea id="message" placeholder="Message"></textarea>
+<div class="row"><label class="muted"><input id="critical" type="checkbox"> Critical</label><button class="primary" onclick="sendMessage()">Send</button><button onclick="refreshAll()">Refresh</button></div>
+</div>
+</section>
+<section>
+<div class="tabs" role="tablist">
+<button id="tabRoles" aria-selected="true" onclick="showTab('roles')">Roles</button>
+<button id="tabGoals" aria-selected="false" onclick="showTab('goals')">Goals</button>
+<button id="tabAssets" aria-selected="false" onclick="showTab('assets')">Assets</button>
+</div>
+<div class="body">
+<div id="rolesPanel" class="stack">
+<div class="row"><select id="roleSelect" onchange="loadRole()"></select><input id="roleName" placeholder="new-role"><button onclick="saveRole()">Save</button><button class="danger" onclick="deleteRole()">Delete</button></div>
+<label>Instructions<textarea id="roleInstructions"></textarea></label>
+<label>Memory<textarea id="roleMemory"></textarea></label>
+<div class="row"><button onclick="saveRoleInstructions()">Save instructions</button><button onclick="saveRoleMemory()">Save memory</button></div>
+</div>
+<div id="goalsPanel" class="stack" hidden>
+<div class="row"><select id="goalSelect" onchange="loadGoal()"></select><input id="goalName" placeholder="goal.md"><button onclick="saveGoal()">Save</button><button class="danger" onclick="deleteGoal()">Delete</button></div>
+<textarea id="goalContent"></textarea>
+</div>
+<div id="assetsPanel" class="stack" hidden>
+<div class="row"><input id="assetName" placeholder="asset.txt"><input id="assetFile" type="file"><button onclick="uploadAsset()">Upload</button></div>
+<div id="assetList" class="list"></div>
+</div>
+</div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function setStatus(text){$('status').textContent=text}
+async function api(path, options){const r=await fetch(path, options); if(!r.ok){throw new Error(await r.text())} return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
+async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets()]); $('chatFrame').src='/chat.html?ts='+Date.now(); setStatus('Refreshed')}
+async function sendMessage(){await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; await refreshAll()}
+function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
+async function loadRoles(){const data=await api('/api/roles'); $('roleSelect').innerHTML=data.roles.map(r=>`<option>${r.role}</option>`).join(''); if(data.roles.length) await loadRole()}
+async function loadRole(){const role=$('roleSelect').value; if(!role)return; const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory}
+async function saveRole(){await saveRoleInstructions(); await saveRoleMemory(); await refreshAll()}
+async function saveRoleInstructions(){const role=$('roleName').value || $('roleSelect').value; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles()}
+async function saveRoleMemory(){const role=$('roleName').value || $('roleSelect').value; await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleMemory').value})}); await loadRoles()}
+async function deleteRole(){const role=$('roleSelect').value; if(role){await api('/api/roles/'+encodeURIComponent(role),{method:'DELETE'}); await refreshAll()}}
+async function loadGoals(){const data=await api('/api/goals'); $('goalSelect').innerHTML=data.goals.map(g=>`<option>${g.name}</option>`).join(''); if(data.goals.length) await loadGoal(); else $('goalContent').value=''}
+async function loadGoal(){const name=$('goalSelect').value; if(!name)return; const data=await api('/api/goals/'+encodeURIComponent(name)); $('goalName').value=data.name; $('goalContent').value=data.content}
+async function saveGoal(){const name=$('goalName').value || $('goalSelect').value; await api('/api/goals/'+encodeURIComponent(name),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:$('goalContent').value})}); await refreshAll()}
+async function deleteGoal(){const name=$('goalSelect').value; if(name){await api('/api/goals/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}}
+async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span></div>`).join('')}
+async function uploadAsset(){const file=$('assetFile').files[0]; const name=$('assetName').value || file?.name; if(!file||!name)return; await fetch('/api/assets/'+encodeURIComponent(name),{method:'PUT',body:file}).then(async r=>{if(!r.ok)throw new Error(await r.text())}); await refreshAll()}
+refreshAll().catch(e=>setStatus(e.message));
+</script>
+</body>
+</html>
+""";
+}
+
+internal static class Markdown
+{
+    public static string ToHtml(string markdown)
+    {
+        var lines = markdown.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Split('\n');
+        var html = new StringBuilder();
+        var paragraph = new StringBuilder();
+        var inCode = false;
+        var inList = false;
+
+        void FlushParagraph()
+        {
+            if (paragraph.Length == 0)
+            {
+                return;
+            }
+
+            html.Append("<p>").Append(Inline(paragraph.ToString().Trim())).AppendLine("</p>");
+            paragraph.Clear();
+        }
+
+        void CloseList()
+        {
+            if (inList)
+            {
+                html.AppendLine("</ul>");
+                inList = false;
+            }
+        }
+
+        foreach (var rawLine in lines)
+        {
+            var line = rawLine;
+            if (line.StartsWith("```", StringComparison.Ordinal))
+            {
+                FlushParagraph();
+                CloseList();
+                if (inCode)
+                {
+                    html.AppendLine("</code></pre>");
+                    inCode = false;
+                }
+                else
+                {
+                    html.AppendLine("<pre><code>");
+                    inCode = true;
+                }
+                continue;
+            }
+
+            if (inCode)
+            {
+                html.Append(WebUtility.HtmlEncode(line)).Append('\n');
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                FlushParagraph();
+                CloseList();
+                continue;
+            }
+
+            var trimmed = line.TrimStart();
+            var headingLevel = HeadingLevel(trimmed);
+            if (headingLevel > 0)
+            {
+                FlushParagraph();
+                CloseList();
+                var text = trimmed[(headingLevel + 1)..].Trim();
+                html.Append("<h").Append(headingLevel).Append(">")
+                    .Append(Inline(text))
+                    .Append("</h").Append(headingLevel).AppendLine(">");
+                continue;
+            }
+
+            if (trimmed.StartsWith("- ", StringComparison.Ordinal) || trimmed.StartsWith("* ", StringComparison.Ordinal))
+            {
+                FlushParagraph();
+                if (!inList)
+                {
+                    html.AppendLine("<ul>");
+                    inList = true;
+                }
+
+                html.Append("<li>").Append(Inline(trimmed[2..].Trim())).AppendLine("</li>");
+                continue;
+            }
+
+            if (paragraph.Length > 0)
+            {
+                paragraph.Append(' ');
+            }
+
+            paragraph.Append(line.Trim());
+        }
+
+        FlushParagraph();
+        CloseList();
+        if (inCode)
+        {
+            html.AppendLine("</code></pre>");
+        }
+
+        return html.ToString();
+    }
+
+    private static int HeadingLevel(string line)
+    {
+        var count = 0;
+        while (count < line.Length && line[count] == '#')
+        {
+            count++;
+        }
+
+        return count is >= 1 and <= 6 && count < line.Length && line[count] == ' ' ? count : 0;
+    }
+
+    private static string Inline(string text)
+    {
+        var encoded = WebUtility.HtmlEncode(text);
+        encoded = Regex.Replace(encoded, "`([^`]+)`", "<code>$1</code>");
+        encoded = Regex.Replace(encoded, "\\*\\*([^*]+)\\*\\*", "<strong>$1</strong>");
+        return encoded;
+    }
+}
+
+internal static class Atomic
+{
+    public static void WriteText(string path, string text)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var tempPath = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        File.WriteAllText(tempPath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        File.Move(tempPath, path, overwrite: true);
+    }
+
+    public static async Task WriteTextAsync(string path, string text)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.WriteThrough);
+        await using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        await writer.WriteAsync(text);
+        await writer.FlushAsync();
+        stream.Flush(flushToDisk: true);
+    }
+}
+
+internal static class Retry
+{
+    public static async Task WithinAsync(int waitMs, Func<Task> action)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
+        Exception? last = null;
+        while (true)
+        {
+            try
+            {
+                await action();
+                return;
+            }
+            catch (IOException ex)
+            {
+                last = ex;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                last = ex;
+            }
+
+            if (waitMs == 0 || DateTime.UtcNow >= deadline)
+            {
+                throw CliException.LockTimeout(last?.Message ?? "Timed out waiting for file lock.");
+            }
+
+            await Task.Delay(75);
+        }
+    }
+}
+
+internal static class Time
+{
+    public static string UtcNowRoundTrip() => RoundTrip(DateTimeOffset.UtcNow);
+    public static string RoundTrip(DateTimeOffset value) => value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+}
+
+internal static class Json
+{
+    public static readonly JsonSerializerOptions Options = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        DefaultIgnoreCondition = JsonIgnoreCondition.Never,
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+    };
+
+    public static string Text<T>(T value) => JsonSerializer.Serialize(value, Options);
+}
+}
