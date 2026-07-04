@@ -37,7 +37,7 @@ After each scenario, inspect the final repository state directly:
 
 - `.simpleagentchat/` exists only where expected.
 - `.gitignore` contains exactly one satisfying `.simpleagentchat/` ignore entry.
-- `HOW_TO_CHAT.md` and `AGENTS.md` preserve user content outside marked blocks.
+- `.simpleagentchat/HOW_TO_CHAT.md` and `AGENTS.md` preserve user content outside marked blocks.
 - role, goal, asset, status, message, `chat.html`, and `ui.html` files match
   the spec.
 - invalid names, cursors, and paths fail without writing outside allowed
@@ -65,8 +65,8 @@ When testing agent-facing behavior, use the tool like an agent would:
 
 Subagents may be used as instruction-clarity smoke tests. For example, ask one
 to join as `implementer` and another as `reviewer`, then observe whether they
-follow `HOW_TO_CHAT.md` without extra steering. If they repeatedly miss a rule,
-update `HOW_TO_CHAT.md` or the generated role instructions so the next agent can
+follow `.simpleagentchat/HOW_TO_CHAT.md` without extra steering. If they repeatedly miss a rule,
+update `.simpleagentchat/HOW_TO_CHAT.md` or the generated role instructions so the next agent can
 follow the workflow naturally.
 
 Do not rely on subagent behavior as the primary correctness test. Deterministic

@@ -16,6 +16,7 @@ internal static class SimpleAgentChatTests
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
             ("markdown renderer covers common chat shapes", TestMarkdownCommonShapes),
             ("initialization creates implementer and reviewer default roles", TestDefaultRoles),
+            ("initialization moves legacy root how-to-chat guide", TestInitializationMovesLegacyHowToChat),
             ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
             ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
@@ -159,6 +160,10 @@ internal static class SimpleAgentChatTests
             Assert(File.Exists(reviewerSource), "reviewer role source copy should exist");
             Assert(File.ReadAllText(reviewerSource).Contains("role runner smoke", StringComparison.Ordinal), "reviewer role source should match repo source");
             Assert(File.Exists(workspace.RoleRunnerDllPath("reviewer")), "reviewer runner DLL should exist");
+            Assert(File.Exists(workspace.HowToChatPath), "how-to-chat guide should exist inside .simpleagentchat");
+            Assert(Path.GetFullPath(workspace.HowToChatPath).StartsWith(Path.GetFullPath(workspace.ChatDir), StringComparison.OrdinalIgnoreCase), "how-to-chat guide should live under .simpleagentchat");
+            Assert(!File.Exists(Path.Combine(root, "HOW_TO_CHAT.md")), "root how-to-chat guide should not be generated");
+            Assert(File.ReadAllText(workspace.AgentsPath).Contains("`.simpleagentchat/HOW_TO_CHAT.md`", StringComparison.Ordinal), "AGENTS.md should point at the room-local how-to-chat guide");
         }
         finally
         {
@@ -187,6 +192,41 @@ internal static class SimpleAgentChatTests
         Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
         Assert(block.Contains("until the goal is done or a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
         Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestInitializationMovesLegacyHowToChat()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "simpleagentchat.cs"), "Console.WriteLine(\"role runner smoke\");\n");
+            var legacyPath = Path.Combine(root, "HOW_TO_CHAT.md");
+            MarkedBlock.Upsert(legacyPath, "old generated instructions\n");
+
+            var workspace = ChatWorkspace.Initialize(root);
+
+            Assert(File.Exists(workspace.HowToChatPath), "room-local how-to-chat guide should exist");
+            Assert(!File.Exists(legacyPath), "generated-only legacy root how-to-chat guide should be deleted");
+
+            File.WriteAllText(legacyPath, "Keep this note.\n");
+            MarkedBlock.Upsert(legacyPath, "old generated instructions\n");
+            ChatWorkspace.Initialize(root);
+
+            Assert(File.Exists(legacyPath), "legacy root file with user content should be preserved");
+            var legacyContent = File.ReadAllText(legacyPath);
+            Assert(legacyContent.Contains("Keep this note.", StringComparison.Ordinal), "legacy user content should remain");
+            Assert(!legacyContent.Contains("old generated instructions", StringComparison.Ordinal), "legacy generated block should be removed");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
         return Task.CompletedTask;
     }
 

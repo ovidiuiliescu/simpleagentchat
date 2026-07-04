@@ -823,7 +823,7 @@ internal sealed class ChatWorkspace
         ChatHtmlPath = Path.Combine(ChatDir, "chat.html");
         UiHtmlPath = Path.Combine(ChatDir, "ui.html");
         GitIgnorePath = Path.Combine(Root, ".gitignore");
-        HowToChatPath = Path.Combine(Root, "HOW_TO_CHAT.md");
+        HowToChatPath = Path.Combine(ChatDir, "HOW_TO_CHAT.md");
         AgentsPath = Path.Combine(Root, "AGENTS.md");
     }
 
@@ -1132,8 +1132,20 @@ internal sealed class ChatWorkspace
     {
         var howBlock = MarkdownBlocks.HowToChatBlock();
         MarkedBlock.Upsert(HowToChatPath, howBlock);
-        var agentsBlock = "If you are asked to join a simpleagentchat chat, read HOW_TO_CHAT.md first and follow it.\n";
+        RemoveLegacyRootHowToChatGuide();
+        var agentsBlock = "If you are asked to join a simpleagentchat chat, read `.simpleagentchat/HOW_TO_CHAT.md` first and follow it.\n";
         MarkedBlock.Upsert(AgentsPath, agentsBlock);
+    }
+
+    private void RemoveLegacyRootHowToChatGuide()
+    {
+        var legacyPath = Path.Combine(Root, "HOW_TO_CHAT.md");
+        if (string.Equals(Path.GetFullPath(legacyPath), Path.GetFullPath(HowToChatPath), StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        MarkedBlock.RemoveIfPresent(legacyPath, deleteIfEmpty: true);
     }
 
     private void EnsureStateFile()
@@ -1155,7 +1167,7 @@ internal sealed class ChatWorkspace
     {
         "implementer" => "# Implementer Role\n\nImplement the goal cleanly and efficiently. Prefer pragmatic DRY and YAGNI. Fetch before meaningful work, read current goals and role memory, and wait for a human `Start` unless one already appears in fetched history.\n",
         "reviewer" => "# Reviewer Role\n\nPerform a thorough code review. Look for gaps the implementer may have missed, flag serious concerns clearly, and if you are unsure why the implementation is done a certain way, ask a question in the chat. Fetch before meaningful review, read current goals and role memory, and mark goals done only after checking the implementation from this role's responsibility.\n",
-        _ => $"# {role} Role\n\nFollow HOW_TO_CHAT.md. Read this file, role_memory.md, and current goals before participating.\n"
+        _ => $"# {role} Role\n\nFollow `.simpleagentchat/HOW_TO_CHAT.md`. Read this file, role_memory.md, and current goals before participating.\n"
     };
 }
 
@@ -1204,6 +1216,31 @@ internal static class MarkedBlock
                 ? newline
                 : newline + newline;
             updated = existing + separator + block + newline;
+        }
+
+        Atomic.WriteText(path, updated);
+    }
+
+    public static void RemoveIfPresent(string path, bool deleteIfEmpty)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        var existing = File.ReadAllText(path, Encoding.UTF8);
+        var startIndex = existing.IndexOf(Start, StringComparison.Ordinal);
+        var endIndex = existing.IndexOf(End, StringComparison.Ordinal);
+        if (startIndex < 0 || endIndex <= startIndex)
+        {
+            return;
+        }
+
+        var updated = existing[..startIndex] + existing[(endIndex + End.Length)..];
+        if (deleteIfEmpty && string.IsNullOrWhiteSpace(updated))
+        {
+            File.Delete(path);
+            return;
         }
 
         Atomic.WriteText(path, updated);

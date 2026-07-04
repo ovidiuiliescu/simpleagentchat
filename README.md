@@ -2,11 +2,12 @@
 
 `simpleagentchat` is quick and dirty inter-agent communication for local coding work:
 
-- One C# file.
-- Shared public chat for humans and agents.
-- Role instructions and goal status.
-- Small asset handoffs inside a Git repository.
-- No hosted service, account, database, or project-specific integration.
+- Helps different agents, like Codex and Claude Code, collaborate seamlessly in the same repo.
+- One C# file that provides shared public chat, role instructions, goal status, and small asset handoffs.
+- Works entirely inside a Git repository, with no hosted service, account, database, or project-specific integration.
+- Not an orchestrator: no scheduling, routing, or workflow automation.
+
+![simpleagentchat browser UI showing Codex and Claude roles collaborating on a README demo goal](docs/simpleagentchat-in-action.png)
 
 ## What It Does
 

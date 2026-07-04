@@ -2,9 +2,9 @@
 
 ## Purpose
 
-`simpleagentchat` is a small, portable coordination tool for humans and coding agents such as Codex, Claude Code, OpenCode, and similar local agents.
+`simpleagentchat` is a small, portable collaboration tool for humans and coding agents such as Codex, Claude Code, OpenCode, and similar local agents.
 
-The goal is to let multiple participants collaborate in a repository using only files on disk plus a single C# file. Agents exchange public chat messages, read shared goals and role instructions, and coordinate work without needing a hosted service, external account, database, or project-specific integration.
+The goal is to let multiple participants collaborate in a repository using only files on disk plus a single C# file. Agents exchange public chat messages, read shared goals and role instructions, and coordinate work without needing a hosted service, external account, database, or project-specific integration. The tool is a collaboration layer, not an orchestrator: it does not schedule agents, route tasks, or automate workflows beyond the shared room primitives.
 
 The intended distribution is one file:
 
@@ -63,6 +63,7 @@ When initialized, the repository contains:
 
 ```text
 .simpleagentchat/
+  HOW_TO_CHAT.md
   assets/
   goal_status/
   goals/
@@ -80,7 +81,6 @@ When initialized, the repository contains:
       runner/
   state.json
   ui.html
-HOW_TO_CHAT.md
 AGENTS.md
 ```
 
@@ -106,7 +106,6 @@ The implementation may write only these root-relative locations:
 
 - `.simpleagentchat/**`
 - `.gitignore`
-- `HOW_TO_CHAT.md`
 - `AGENTS.md`
 
 The server must never serve or mutate arbitrary repository files. Every user-supplied path or name must be converted to a full path and validated to remain under the intended base directory before any read, write, delete, or serve operation happens.
@@ -176,7 +175,8 @@ Rules:
 - Create `.gitignore` if missing.
 - Add `.simpleagentchat/` to `.gitignore` once. Treat existing `.simpleagentchat` and `.simpleagentchat/` entries as already satisfying this requirement.
 - Preserve all existing `.gitignore` content and line endings as much as practical.
-- Create or update the simpleagentchat block in `HOW_TO_CHAT.md` using the markers below.
+- Create or update the simpleagentchat block in `.simpleagentchat/HOW_TO_CHAT.md` using the markers below.
+- Remove the legacy root `HOW_TO_CHAT.md` simpleagentchat block if present; delete that root file only when no non-whitespace content remains outside the removed block.
 - Create or update the simpleagentchat block in `AGENTS.md` using the markers below.
 - Preserve all content outside the marked blocks.
 
@@ -347,9 +347,9 @@ dotnet simpleagentchat.cs serve
 
 The browser UI should write through the same internal message path as the CLI `say` command.
 
-## Root Instruction Files
+## Instruction Files
 
-### `HOW_TO_CHAT.md`
+### `.simpleagentchat/HOW_TO_CHAT.md`
 
 `serve` or `init` creates this file if missing.
 
@@ -384,7 +384,7 @@ It explains:
 The block should say, in substance:
 
 ```text
-If you are asked to join a simpleagentchat chat, read HOW_TO_CHAT.md first and follow it.
+If you are asked to join a simpleagentchat chat, read `.simpleagentchat/HOW_TO_CHAT.md` first and follow it.
 ```
 
 If `AGENTS.md` already exists, the tool should append a clearly marked block instead of rewriting unrelated content.
@@ -420,7 +420,7 @@ It should:
 3. Ensure required folders exist.
 4. Ensure default role directories and files exist if no roles are present.
 5. Ensure `.simpleagentchat/` is ignored by git.
-6. Ensure `HOW_TO_CHAT.md` exists.
+6. Ensure `.simpleagentchat/HOW_TO_CHAT.md` exists.
 7. Ensure `AGENTS.md` contains the simpleagentchat instruction block.
 8. Write or refresh `ui.html`.
 9. Start a tiny localhost server.
@@ -875,7 +875,7 @@ Recheck should be used with care because it resets all current role approvals fo
 
 ## Chat Etiquette
 
-These rules belong in `HOW_TO_CHAT.md` and should be followed by all agents:
+These rules belong in `.simpleagentchat/HOW_TO_CHAT.md` and should be followed by all agents:
 
 - Fetch all previous context before joining.
 - Initial no-cursor fetches omit historical `system` messages by default; use current files as the source of truth.
