@@ -32,6 +32,6 @@ dotnet .\simpleagentchat.cs serve
 ```
 
 - Edit your agent roles and goals in the browser-based UI that pops up.
-- Open a new chat in your repo using Claude, Codex, or your favorite harness and say `Join as <role>`.
+- Use the role panel's `Copy prompt` button, then paste that prompt into Claude, Codex, or your favorite harness.
 - Once everything is configured, say `Start` in the chat window.
 - Watch the magic happen.

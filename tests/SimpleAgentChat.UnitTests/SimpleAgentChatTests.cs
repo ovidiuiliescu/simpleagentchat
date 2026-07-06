@@ -18,6 +18,7 @@ internal static class SimpleAgentChatTests
             ("initialization creates implementer and reviewer default roles", TestDefaultRoles),
             ("initialization moves legacy root how-to-chat guide", TestInitializationMovesLegacyHowToChat),
             ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
+            ("role join prompt clearly explains how to join", TestRoleJoinPromptIsClear),
             ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
             ("goal status store computes current role completion", TestGoalStatusStore),
@@ -80,6 +81,9 @@ internal static class SimpleAgentChatTests
         Assert(!initial.IncludeSystem, "initial fetch filters system by default");
 
         const string cursor = "20260704T123456.1234567Z-implementer-a1b2c3";
+        var defaultWait = FetchArgs.Parse(new[] { cursor });
+        AssertEqual(FetchArgs.DefaultWaitMs, defaultWait.WaitMs, "default fetch wait");
+
         var cursorFetch = FetchArgs.Parse(new[] { cursor, "5" });
         AssertEqual(cursor, cursorFetch.Cursor, "cursor");
         AssertEqual(5, cursorFetch.WaitMs, "positional wait");
@@ -164,7 +168,12 @@ internal static class SimpleAgentChatTests
             Assert(File.Exists(workspace.HowToChatPath), "how-to-chat guide should exist inside .simpleagentchat");
             Assert(Path.GetFullPath(workspace.HowToChatPath).StartsWith(Path.GetFullPath(workspace.ChatDir), StringComparison.OrdinalIgnoreCase), "how-to-chat guide should live under .simpleagentchat");
             Assert(!File.Exists(Path.Combine(root, "HOW_TO_CHAT.md")), "root how-to-chat guide should not be generated");
-            Assert(File.ReadAllText(workspace.AgentsPath).Contains("`.simpleagentchat/HOW_TO_CHAT.md`", StringComparison.Ordinal), "AGENTS.md should point at the room-local how-to-chat guide");
+            var agentsBlock = File.ReadAllText(workspace.AgentsPath);
+            Assert(agentsBlock.Contains("`.simpleagentchat/HOW_TO_CHAT.md`", StringComparison.Ordinal), "AGENTS.md should point at the room-local how-to-chat guide");
+            Assert(agentsBlock.Contains("always keep polling until you are explicitly instructed not to", StringComparison.Ordinal), "AGENTS.md should include the simpleagentchat polling reminder");
+            Assert(agentsBlock.Contains("If a long poll returns no messages or times out, continue polling", StringComparison.Ordinal), "AGENTS.md should mention empty long-poll responses");
+            Assert(agentsBlock.Contains("always announce whenever something you do might be of meaningful interest to others", StringComparison.Ordinal), "AGENTS.md should include the meaningful-interest announcement reminder");
+            Assert(agentsBlock.Contains("code changes, environment changes, test results, or other shared state changes", StringComparison.Ordinal), "AGENTS.md should include examples of meaningful-interest events");
         }
         finally
         {
@@ -190,7 +199,8 @@ internal static class SimpleAgentChatTests
         Assert(block.Contains("Do not repair `%TEMP%\\dotnet\\runfile` by hand", StringComparison.Ordinal), "runfile cache warning missing");
         Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening", StringComparison.Ordinal), "join listening warning missing");
         Assert(block.Contains("Do not stop just because all current goals are done; new goals can appear after completion", StringComparison.Ordinal), "goal-completion polling warning missing");
-        Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json", StringComparison.Ordinal), "role runner long wait example missing");
+        Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json", StringComparison.Ordinal), "initial fetch should return immediately");
+        Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 600000 --json", StringComparison.Ordinal), "role runner long wait example missing");
         Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
         Assert(block.Contains("until a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
         Assert(block.Contains("Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added", StringComparison.Ordinal), "post-goal polling guidance missing");
@@ -199,6 +209,42 @@ internal static class SimpleAgentChatTests
         Assert(block.Contains("Keep these progress updates concise and avoid spamming routine activity", StringComparison.Ordinal), "anti-spam progress guidance missing");
         Assert(block.Contains("When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is", StringComparison.Ordinal), "handoff clarity guidance missing");
         Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestRoleJoinPromptIsClear()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "simpleagentchat.cs"), "Console.WriteLine(\"role runner smoke\");\n");
+            var workspace = ChatWorkspace.Initialize(root);
+            var prompt = RolePrompts.BuildJoinPrompt(workspace, "reviewer");
+
+            Assert(prompt.Contains("Join the existing simpleagentchat room in this repository under the assigned role", StringComparison.Ordinal), "prompt should state the room and assigned role");
+            Assert(prompt.Contains($"Repository root: {workspace.Root}", StringComparison.Ordinal), "prompt should include repo root");
+            Assert(prompt.Contains("Assigned role: reviewer", StringComparison.Ordinal), "prompt should include assigned role");
+            Assert(prompt.Contains("Do not run the root `simpleagentchat.cs` file for chat commands", StringComparison.Ordinal), "prompt should steer away from the root file runner");
+            Assert(prompt.Contains("Read `.simpleagentchat/HOW_TO_CHAT.md`", StringComparison.Ordinal), "prompt should tell agents to read the protocol guide");
+            Assert(prompt.Contains("Read the current overall goals in `.simpleagentchat/goals/`", StringComparison.Ordinal), "prompt should tell agents to read goals");
+            Assert(prompt.Contains("`.simpleagentchat/roles/reviewer/instructions.md`", StringComparison.Ordinal), "prompt should include role instructions path");
+            Assert(prompt.Contains("`.simpleagentchat/roles/reviewer/role_memory.md`", StringComparison.Ordinal), "prompt should include role memory path");
+            Assert(prompt.Contains("fetch --wait-ms 0 --json", StringComparison.Ordinal), "prompt should include immediate first fetch command");
+            Assert(prompt.Contains("announce yourself briefly", StringComparison.Ordinal), "prompt should include conditional self-announcement");
+            Assert(prompt.Contains("keep polling/fetching for other messages", StringComparison.Ordinal), "prompt should include ongoing polling guidance");
+            Assert(prompt.Contains("fetch <nextCursor> --wait-ms 600000 --json", StringComparison.Ordinal), "prompt should include long-poll command");
+            Assert(prompt.Contains("If a long poll returns no messages or times out, continue polling", StringComparison.Ordinal), "prompt should include empty long-poll guidance");
+            Assert(prompt.Contains("goal done reviewer <goal_file_name>", StringComparison.Ordinal), "prompt should include role-specific goal completion command");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
         return Task.CompletedTask;
     }
 
@@ -241,6 +287,10 @@ internal static class SimpleAgentChatTests
     {
         Assert(UiShell.Html.Contains("Add new role", StringComparison.Ordinal), "role add button missing");
         Assert(UiShell.Html.Contains("renameRole()", StringComparison.Ordinal), "role rename action missing");
+        Assert(UiShell.Html.Contains("Copy prompt", StringComparison.Ordinal), "role copy prompt button missing");
+        Assert(UiShell.Html.Contains("copyRolePrompt()", StringComparison.Ordinal), "role copy prompt action missing");
+        Assert(UiShell.Html.Contains("currentRolePrompt=text(data.joinPrompt)", StringComparison.Ordinal), "role prompt data binding missing");
+        Assert(UiShell.Html.Contains("navigator.clipboard", StringComparison.Ordinal), "clipboard API usage missing");
         Assert(UiShell.Html.Contains("Add new goal", StringComparison.Ordinal), "goal add button missing");
         Assert(UiShell.Html.Contains("renameGoal()", StringComparison.Ordinal), "goal rename action missing");
         Assert(UiShell.Html.Contains("saveGoal()", StringComparison.Ordinal), "goal save action missing");

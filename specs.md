@@ -51,8 +51,8 @@ The tool should not require a `.csproj` file in the host repository.
 .NET file-based app builds are cached by source file and SDK inputs. Concurrent invocations of the same file-based app can contend for the cached output when one process is still running or another process is building. This is .NET SDK build-cache contention, not contention in simpleagentchat's message files. Generated agent instructions should always tell agents to run the already-built role-local runner because an agent cannot know whether another participant is active until after it runs a command:
 
 ```powershell
-dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json
-dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <cursor> --wait-ms 300000 --json
+dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json
+dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <cursor> --wait-ms 600000 --json
 ```
 
 Role setup owns creating and refreshing `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` and `.simpleagentchat/roles/<role>/runner/`. The role-local source copy gives each role a separate .NET file-based build-cache identity, and agents execute the built DLL rather than asking the SDK to build the root source file. Agents must not manually copy files inside `%TEMP%\dotnet\runfile`.
@@ -328,6 +328,7 @@ This is the local-server UI shell used by `serve`. It must include:
 - human message prompt
 - role editor
 - role memory/thoughts editor
+- copyable role join prompt for each role
 - goal editor
 - current per-role completion status for every goal
 - asset browser or upload form
@@ -368,7 +369,7 @@ It explains:
 - agents should use `goal recheck <goal_file_name> <reason>` when important changes require all roles to re-approve a goal
 - agents must track the `nextCursor` returned by `fetch`, not the cursor returned by their own `say`
 - agents must keep listening for new chat messages once they join until a human or system message explicitly tells their role to stop listening; all current goals being done is not a stop condition because new goals can appear
-- agents must use a long wait, such as `fetch <nextCursor> --wait-ms 300000 --json`, when no messages are available yet, and repeat after `timedOut: true` instead of stopping
+- agents must use a long wait, such as `fetch <nextCursor> --wait-ms 600000 --json`, when no messages are available yet, and repeat after `timedOut: true` instead of stopping
 - agents must fetch from their latest fetched cursor before each meaningful work step
 - agents should post concise progress updates when large or important chunks of work are completed, even if the whole goal is not done yet, while avoiding routine spam
 - agents must send a handoff message when their role finishes its part, saying what changed or what work was done and what their conclusion is
@@ -387,6 +388,8 @@ The block should say, in substance:
 
 ```text
 If you are asked to join a simpleagentchat chat, read `.simpleagentchat/HOW_TO_CHAT.md` first and follow it.
+While in simpleagentchat mode, always keep polling until you are explicitly instructed not to, even when you think no further polling is needed. If a long poll returns no messages or times out, continue polling; otherwise, you may miss messages.
+While in simpleagentchat mode, always announce whenever something you do might be of meaningful interest to others, including code changes, environment changes, test results, or other shared state changes.
 ```
 
 If `AGENTS.md` already exists, the tool should append a clearly marked block instead of rewriting unrelated content.
@@ -435,6 +438,7 @@ The server should let the human:
 - send a `human` chat message
 - create, edit, and delete role instructions
 - view and edit role memory/thoughts files
+- copy a role-specific join prompt that tells an agent which repo and role to join, what context to read first, how to announce itself if needed, and how to work while polling the chat
 - create, edit, and delete goal files
 - view current per-role completion status for every goal
 - view assets
@@ -525,7 +529,7 @@ For debugging or complete transcript export, callers may request system messages
 dotnet simpleagentchat.cs fetch --include-system
 ```
 
-`wait-ms` controls how long the command waits for a new message when no output messages are available. It defaults to `30000`. A value of `0` means return immediately.
+`wait-ms` controls how long the command waits for a new message when no output messages are available. It defaults to `600000` (ten minutes). A value of `0` means return immediately.
 
 For cursor-based fetches, the wait may be supplied positionally after the cursor or with `--wait-ms <ms>`. For initial no-cursor fetches, callers must use `--wait-ms <ms>` to override the default wait. A bare first positional value is always parsed as a cursor, so `fetch 0` is invalid rather than an initial fetch with zero wait.
 
@@ -551,7 +555,7 @@ Agents should:
 1. Fetch initial context when joining.
 2. Expect historical `system` messages to be filtered out of that initial no-cursor fetch by default.
 3. Track the `nextCursor` returned by `fetch`.
-4. Keep listening from that cursor with long waits, for example `fetch <nextCursor> --wait-ms 300000 --json`, until a fetched message explicitly says not to listen.
+4. Keep listening from that cursor with long waits, for example `fetch <nextCursor> --wait-ms 600000 --json`, until a fetched message explicitly says not to listen.
 5. Fetch from that cursor before each meaningful work step.
 
 Agents must not advance their fetch cursor to the id returned by their own `say` command unless that message later appears in a `fetch` result. The fetch cursor means "the latest message I have fetched from the shared transcript", not "the latest message I personally sent".
@@ -892,7 +896,7 @@ These rules belong in `.simpleagentchat/HOW_TO_CHAT.md` and should be followed b
 - Review what your role previously said or attempted, then continue from there.
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
 - Once you join, always keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion.
-- If no messages are available yet, run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat after `timedOut: true`.
+- If no messages are available yet, run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 600000 --json` and repeat after `timedOut: true`.
 - After joining, always fetch from your latest fetched cursor before each meaningful work step.
 - To improve collaboration, inform the chat when you complete a large or important chunk of work, even if the whole goal is not done yet. Keep these progress updates concise and avoid spamming routine activity.
 - When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is.
@@ -986,7 +990,7 @@ Endpoint contracts:
 - `POST /api/messages` accepts `{ "markdown": "...", "critical": false }`, writes a `human` message, and returns the created message object plus `nextCursor`. If `critical` is `true` and the trimmed Markdown does not start with `!`, the server prepends `! ` before writing the message.
 - `GET /api/roles` returns role names and metadata for valid role directories.
 - `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, creates and builds that role's local runner, rejects existing roles, and emits a `roles.changed` system message.
-- `GET /api/roles/<role>` returns `{ "role": "...", "instructions": "...", "memory": "..." }`.
+- `GET /api/roles/<role>` returns `{ "role": "...", "instructions": "...", "memory": "...", "joinPrompt": "..." }`, where `joinPrompt` is a clear copyable prompt for assigning an agent to join the current repository's simpleagentchat room under that role, read the room goals, role files, chat history, and repo context first, announce itself if needed, then work while continuing to poll the chat.
 - `PUT /api/roles/<role>/instructions` accepts `{ "markdown": "..." }`, creates the role directory, default `role_memory.md`, and role-local runner if the role does not already exist, writes `instructions.md`, and emits a `roles.changed` system message.
 - `PUT /api/roles/<role>/memory` accepts `{ "markdown": "..." }`, writes `role_memory.md`, and emits a `roles.memory.changed` system message because the edit came through the human/UI channel.
 - `POST /api/roles/<role>/rename` accepts `{ "role": "new-role" }`, renames the current role, rejects existing target roles, preserves instructions and memory, refreshes and builds the renamed role's local runner, updates goal status metadata for the renamed role, and emits a `roles.changed` system message.
@@ -1055,7 +1059,7 @@ A successful v1 should support:
 - Cursor-based `fetch` includes newly observed `system` messages by default.
 - `fetch` returns a `nextCursor` watermark even when messages are filtered from output.
 - `fetch --json` returns the specified JSON schema for messages, timeouts, and errors.
-- `fetch <cursor> <wait-ms>` returns newer messages or waits briefly.
+- `fetch <cursor> <wait-ms>` returns newer messages or waits up to the requested duration.
 - `goal done <role> <goal_file_name>` records public completion agreement for that role.
 - `goal undone <role> <goal_file_name>` withdraws that role's completion agreement.
 - `goal status <goal_file_name>` reports status for every current valid role and reports complete only when all are `done`.

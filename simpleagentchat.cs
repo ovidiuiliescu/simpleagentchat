@@ -349,6 +349,8 @@ internal sealed record SayArgs(string Role, int WaitMs, string? InlineMarkdown, 
 
 internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool IncludeSystem)
 {
+    public const int DefaultWaitMs = 600000;
+
     public static FetchArgs Parse(string[] args)
     {
         string? cursor = null;
@@ -416,7 +418,7 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
             throw CliException.Usage("usage", "wait-ms cannot be supplied both positionally and with --wait-ms.");
         }
 
-        var finalWaitMs = waitMs ?? positionalWaitMs ?? 30000;
+        var finalWaitMs = waitMs ?? positionalWaitMs ?? DefaultWaitMs;
         var finalIncludeSystem = includeSystem ?? (cursor is not null);
         return new FetchArgs(cursor, finalWaitMs, json, finalIncludeSystem);
     }
@@ -1133,7 +1135,9 @@ internal sealed class ChatWorkspace
         var howBlock = MarkdownBlocks.HowToChatBlock();
         MarkedBlock.Upsert(HowToChatPath, howBlock);
         RemoveLegacyRootHowToChatGuide();
-        var agentsBlock = "If you are asked to join a simpleagentchat chat, read `.simpleagentchat/HOW_TO_CHAT.md` first and follow it.\n";
+        var agentsBlock = "If you are asked to join a simpleagentchat chat, read `.simpleagentchat/HOW_TO_CHAT.md` first and follow it.\n" +
+                          "While in simpleagentchat mode, always keep polling until you are explicitly instructed not to, even when you think no further polling is needed. If a long poll returns no messages or times out, continue polling; otherwise, you may miss messages.\n" +
+                          "While in simpleagentchat mode, always announce whenever something you do might be of meaningful interest to others, including code changes, environment changes, test results, or other shared state changes.\n";
         MarkedBlock.Upsert(AgentsPath, agentsBlock);
     }
 
@@ -1256,7 +1260,7 @@ The active chat lives in `.simpleagentchat/`.
 
 Command forms:
 
-- Always run chat commands through your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json`.
+- Always run chat commands through your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json`.
 - Examples below use `reviewer`; replace it with your assigned role name.
 - The room creates and refreshes `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` and `.simpleagentchat/roles/<role>/runner/` when roles are created, renamed, or initialized.
 - If your role-local runner is missing, stop and ask the human to refresh the role setup before joining.
@@ -1266,10 +1270,10 @@ Command forms:
 
 Before joining as an agent:
 
-- Fetch all prior messages with your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --json`.
+- Fetch all prior messages with your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json`.
 - Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
 - Preserve the returned `nextCursor`, even when messages were filtered out.
-- CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion. If no messages are available yet, do not stop; run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 300000 --json` and repeat it after timeouts so you can respond to incoming messages.
+- CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion. If no messages are available yet, do not stop; run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 600000 --json` and repeat it after timeouts so you can respond to incoming messages.
 - Read all files in `.simpleagentchat/goals/`.
 - Read `.simpleagentchat/roles/<role>/instructions.md`.
 - Read `.simpleagentchat/roles/<role>/role_memory.md`.
@@ -2022,7 +2026,8 @@ internal sealed class LocalServer
         {
             role,
             instructions = File.ReadAllText(Path.Combine(dir, "instructions.md"), Encoding.UTF8),
-            memory = File.ReadAllText(Path.Combine(dir, "role_memory.md"), Encoding.UTF8)
+            memory = File.ReadAllText(Path.Combine(dir, "role_memory.md"), Encoding.UTF8),
+            joinPrompt = RolePrompts.BuildJoinPrompt(_workspace, role)
         };
     }
 
@@ -2963,6 +2968,51 @@ internal static class PlainText
     }
 }
 
+internal static class RolePrompts
+{
+    public static string RunnerPath(string role) => $".simpleagentchat/roles/{role}/runner/simpleagentchat-{role}.dll";
+
+    public static string RunnerCommand(string role) => $"dotnet {RunnerPath(role)}";
+
+    public static string BuildJoinPrompt(ChatWorkspace workspace, string role)
+    {
+        var runnerCommand = RunnerCommand(role);
+        var roleDir = $".simpleagentchat/roles/{role}";
+        var powerShellLocation = $"Set-Location -LiteralPath '{PowerShellSingleQuoted(workspace.Root)}'";
+
+        return string.Join("\n", new[]
+        {
+            "Join the existing simpleagentchat room in this repository under the assigned role.",
+            "",
+            $"Repository root: {workspace.Root}",
+            $"PowerShell setup: {powerShellLocation}",
+            $"Assigned role: {role}",
+            "",
+            "Use this role-local runner for all chat commands:",
+            $"`{runnerCommand}`",
+            "",
+            "Do not run the root `simpleagentchat.cs` file for chat commands.",
+            "",
+            "Before you speak or change files, get acquainted with the room and repo:",
+            "1. Read `.simpleagentchat/HOW_TO_CHAT.md` and follow it, including whether a human `Start` is already present or still required.",
+            "2. Read the current overall goals in `.simpleagentchat/goals/`.",
+            $"3. Read your assigned role files: `{roleDir}/instructions.md` and `{roleDir}/role_memory.md`.",
+            $"4. Fetch prior chat history with `{runnerCommand} fetch --wait-ms 0 --json`.",
+            $"5. Review prior non-system messages from `{role}` and inspect the repository context enough to understand the requested work.",
+            "",
+            $"Then join as `{role}`:",
+            $"- If your current participation is not already clear from the fetched chat, announce yourself briefly with `{runnerCommand} say {role} \"...\"`.",
+            "- Start the simpleagentchat protocol: do the role's work, and keep polling/fetching for other messages in the meantime.",
+            "- Track the latest `nextCursor`. Before each meaningful work step, fetch from it and obey human, system, and relevant role messages.",
+            $"- If no messages are available, long-poll with `{runnerCommand} fetch <nextCursor> --wait-ms {FetchArgs.DefaultWaitMs} --json`. If a long poll returns no messages or times out, continue polling.",
+            "- Do not stop just because current goals are done; keep listening until a human or system message explicitly tells your role to stop.",
+            $"- When your role finishes its part, post a concise handoff/conclusion. Use `{runnerCommand} goal done {role} <goal_file_name>` only after checking the goal from your role's responsibility."
+        }) + "\n";
+    }
+
+    private static string PowerShellSingleQuoted(string value) => value.Replace("'", "''", StringComparison.Ordinal);
+}
+
 internal static class HtmlViews
 {
     public static void RegenerateChat(ChatWorkspace workspace)
@@ -3108,7 +3158,7 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 </div>
 <div class="body">
 <div id="rolesPanel" class="stack">
-<div class="management"><div class="management-fields"><label class="field required"><span>Role</span><select id="roleSelect" required onchange="loadRole()"></select></label><label class="field required"><span>Name</span><input id="roleName" required placeholder="new-role"></label></div><div class="management-actions"><button onclick="renameRole()">Rename</button><button onclick="addRole()">Add new role</button><button class="danger" onclick="deleteRole()">Delete</button></div></div>
+<div class="management"><div class="management-fields"><label class="field required"><span>Role</span><select id="roleSelect" required onchange="loadRole()"></select></label><label class="field required"><span>Name</span><input id="roleName" required placeholder="new-role"></label></div><div class="management-actions"><button onclick="copyRolePrompt()">Copy prompt</button><button onclick="renameRole()">Rename</button><button onclick="addRole()">Add new role</button><button class="danger" onclick="deleteRole()">Delete</button></div></div>
 <label class="field"><span>Instructions</span><textarea id="roleInstructions"></textarea></label>
 <label class="field"><span>Memory</span><textarea id="roleMemory"></textarea></label>
 <div class="row"><button onclick="saveRoleInstructions()">Save instructions</button><button onclick="saveRoleMemory()">Save memory</button></div>
@@ -3130,6 +3180,7 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 const $=id=>document.getElementById(id);
 let chatCursor=null;
 let chatMessageIds=new Set();
+let currentRolePrompt='';
 function setStatus(text){$('status').textContent=text}
 async function api(path, options){const r=await fetch(path, options); if(!r.ok){throw new Error(await r.text())} return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function text(value){return value==null?'':String(value)}
@@ -3145,8 +3196,10 @@ async function sendMessage(){const state=chatScrollState(); const data=await api
 function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
 function replaceOptions(select, values){select.textContent=''; for(const value of values){const option=document.createElement('option'); option.value=value; option.textContent=value; select.appendChild(option)}}
 function requiredValue(id){const element=$(id); const value=element.value.trim(); if(!value){element.reportValidity?.(); element.focus(); return null} return value}
-async function loadRoles(selected){const current=selected||$('roleSelect').value; const data=await api('/api/roles'); const roles=data.roles||[]; replaceOptions($('roleSelect'),roles.map(r=>r.role)); if(current && roles.some(r=>r.role===current)){$('roleSelect').value=current} if(roles.length) await loadRole(); else {$('roleName').value=''; $('roleInstructions').value=''; $('roleMemory').value=''}}
-async function loadRole(){const role=$('roleSelect').value; if(!role)return; const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory}
+async function loadRoles(selected){const current=selected||$('roleSelect').value; const data=await api('/api/roles'); const roles=data.roles||[]; replaceOptions($('roleSelect'),roles.map(r=>r.role)); if(current && roles.some(r=>r.role===current)){$('roleSelect').value=current} if(roles.length) await loadRole(); else {currentRolePrompt=''; $('roleName').value=''; $('roleInstructions').value=''; $('roleMemory').value=''}}
+async function loadRole(){const role=$('roleSelect').value; if(!role){currentRolePrompt=''; return} const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory; currentRolePrompt=text(data.joinPrompt)}
+async function copyText(value){if(navigator.clipboard?.writeText){try{await navigator.clipboard.writeText(value); return}catch{}} const area=document.createElement('textarea'); area.value=value; area.setAttribute('readonly',''); area.style.position='fixed'; area.style.left='-9999px'; document.body.appendChild(area); area.select(); const ok=document.execCommand('copy'); area.remove(); if(!ok)throw new Error('Clipboard copy failed')}
+async function copyRolePrompt(){const role=$('roleSelect').value; if(!role)return; if(!currentRolePrompt)await loadRole(); await copyText(currentRolePrompt); setStatus('Copied prompt for '+role)}
 async function addRole(){const role=requiredValue('roleName'); if(!role)return; await api('/api/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role,instructions:$('roleInstructions').value,memory:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
 async function renameRole(){const role=$('roleSelect').value; const next=requiredValue('roleName'); if(!role||!next)return; await api('/api/roles/'+encodeURIComponent(role)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:next})}); await loadRoles(next); await loadNewMessages()}
 async function saveRoleInstructions(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles(role); await loadNewMessages()}
