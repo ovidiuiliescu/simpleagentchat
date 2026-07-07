@@ -345,8 +345,9 @@ This is the local-server UI shell used by `serve`. It must include:
 - current per-role completion status for every goal
 - asset browser or upload form
 - controls for sending critical messages
+- a chat export control that writes `.simpleagentchat/chat.html`
 
-The local-server UI should use the full browser width available to it. Role and goal management controls should keep rename, add, and delete buttons on a separate action row from the selected item and name fields.
+The local-server UI should use the full browser width available to it. The role editor should keep the selected Role field and editable Name field on separate rows. The dirty-state Save button saves instructions and memory for the currently selected role only. The Name row should provide `Add new` and `Rename existing` actions: `Add new` is disabled when the typed name already exists, and `Rename existing` is disabled when no role is selected, when the typed name matches the opened role, or when the typed name belongs to another existing role. The role editor should also provide a confirmed Clear action that empties the current role draft fields without deleting any saved role. Goal management controls should keep rename, add, and delete buttons on a separate action row from the selected item and name fields.
 
 Mandatory fields, including role names and goal names, should show a red `*` next to the field label and should render with a red border while empty.
 
@@ -1042,10 +1043,12 @@ GET  /
 GET  /chat.html
 GET  /api/messages?cursor=<cursor>&waitMs=<ms>&includeSystem=<bool>
 GET  /api/events
+POST /api/export-html
 POST /api/messages
 GET  /api/roles
 POST /api/roles
 GET  /api/roles/<role>
+PUT  /api/roles/<role>
 PUT  /api/roles/<role>/instructions
 PUT  /api/roles/<role>/memory
 POST /api/roles/<role>/rename
@@ -1068,10 +1071,12 @@ Endpoint contracts:
 - `GET /chat.html` serves an on-demand read-only transcript without writing `.simpleagentchat/chat.html`.
 - `GET /api/messages` returns the same core JSON schema as `fetch --json`, with an additional `html` field on each message for safe browser rendering. For UI use and cursor-based polling, `includeSystem` should default to `true`; for no-cursor agent CLI fetches it defaults to `false`.
 - `GET /api/events` returns a Server-Sent Events stream that notifies browser clients when messages, roles, goals, goal status files, or assets change. The server should watch the chat files so messages written by agent CLI commands refresh the browser UI without manual polling.
+- `POST /api/export-html` regenerates `.simpleagentchat/chat.html` with the same renderer used by `export-html` and returns the saved file path plus the read-only transcript URL.
 - `POST /api/messages` accepts `{ "markdown": "...", "critical": false }`, writes a `human` message, and returns the created message object plus `nextCursor`. If `critical` is `true` and the trimmed Markdown does not start with `!`, the server prepends `! ` before writing the message.
 - `GET /api/roles` returns role names and metadata for valid role directories.
 - `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, creates and builds that role's local runner, rejects existing roles, and emits a `roles.changed` system message.
 - `GET /api/roles/<role>` returns `{ "role": "...", "instructions": "...", "memory": "...", "joinPrompt": "..." }`, where `joinPrompt` is a clear copyable prompt for assigning an agent to join the current repository's simpleagentchat room under that role, read the room goals, role files, chat history, and repo context first, announce itself if needed, then work while continuing to poll the chat.
+- `PUT /api/roles/<role>` accepts `{ "instructions": "...", "memory": "..." }`, updates an existing role's instructions and memory, rejects missing roles, refreshes that role's local runner, and emits one `roles.changed` system message.
 - `PUT /api/roles/<role>/instructions` accepts `{ "markdown": "..." }`, creates the role directory, default `role_memory.md`, and role-local runner if the role does not already exist, writes `instructions.md`, and emits a `roles.changed` system message.
 - `PUT /api/roles/<role>/memory` accepts `{ "markdown": "..." }`, writes `role_memory.md`, and emits a `roles.memory.changed` system message because the edit came through the human/UI channel.
 - `POST /api/roles/<role>/rename` accepts `{ "role": "new-role" }`, renames the current role, rejects existing target roles, preserves instructions and memory, refreshes and builds the renamed role's local runner, updates goal status metadata for the renamed role, and emits a `roles.changed` system message.

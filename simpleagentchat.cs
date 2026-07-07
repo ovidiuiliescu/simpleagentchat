@@ -2088,6 +2088,7 @@ internal static class AssetLimits
 }
 
 internal sealed record RoleListItem(string Role, long InstructionsLength, long MemoryLength, string? UpdatedAtUtc);
+internal sealed record RoleSaveResult(bool Created, Message Message);
 internal sealed record GoalListItem(string Name, long Length, string? UpdatedAtUtc, bool Complete, GoalStatusReport Status);
 internal sealed record AssetListItem(string Name, long Length, string? UpdatedAtUtc);
 
@@ -2107,6 +2108,42 @@ internal static class ResourceOperations
                     LatestWriteUtc(instructions, memory));
             })
             .ToArray();
+
+    public static async Task<RoleSaveResult> SaveRoleAsync(ChatWorkspace workspace, string role, string? instructions, string? memory, int waitMs, bool createIfMissing)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = workspace.RoleDirectory(role);
+        var created = !Directory.Exists(dir);
+        if (created && !createIfMissing)
+        {
+            throw CliException.Validation("missing_role", $"Role '{role}' does not exist.");
+        }
+
+        workspace.EnsureRoleFiles(role);
+        var instructionsPath = Path.Combine(dir, "instructions.md");
+        var memoryPath = Path.Combine(dir, "role_memory.md");
+        if (instructions is not null)
+        {
+            Atomic.WriteText(instructionsPath, instructions);
+        }
+
+        if (memory is not null)
+        {
+            Atomic.WriteText(memoryPath, memory);
+        }
+
+        var message = await new MessageStore(workspace).AppendAsync(
+            "system",
+            "roles.changed",
+            "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
+            new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, memoryPath), RootRelative(workspace, workspace.RoleSourcePath(role)) },
+            waitMs);
+        return new RoleSaveResult(created, message);
+    }
 
     public static async Task<IReadOnlyList<Message>> AddRoleAsync(ChatWorkspace workspace, RoleCommandArgs args)
     {
@@ -2693,6 +2730,12 @@ internal sealed class LocalServer
             return;
         }
 
+        if (segments.Length == 2 && segments[1] == "export-html" && method == "POST")
+        {
+            await ExportHtmlAsync(context);
+            return;
+        }
+
         if (segments.Length >= 2 && segments[1] == "roles")
         {
             await RouteRolesAsync(context, method, segments);
@@ -2868,6 +2911,12 @@ internal sealed class LocalServer
             return;
         }
 
+        if (segments.Length == 3 && method == "PUT")
+        {
+            await PutRoleAsync(context, segments[2]);
+            return;
+        }
+
         if (segments.Length == 3 && method == "DELETE")
         {
             await DeleteRoleAsync(context, segments[2]);
@@ -2917,6 +2966,25 @@ internal sealed class LocalServer
         };
     }
 
+    private async Task ExportHtmlAsync(HttpListenerContext context)
+    {
+        HtmlViews.RegenerateChat(_workspace);
+        await WriteJsonAsync(context, 200, new { path = _workspace.ChatHtmlPath, url = "/chat.html" });
+    }
+
+    private async Task PutRoleAsync(HttpListenerContext context, string role)
+    {
+        using var document = await ReadJsonDocumentAsync(context.Request);
+        var result = await ResourceOperations.SaveRoleAsync(
+            _workspace,
+            role,
+            GetString(document, "instructions"),
+            GetString(document, "memory"),
+            30000,
+            createIfMissing: false);
+        await WriteJsonAsync(context, 200, new { role, created = result.Created, message = result.Message });
+    }
+
     private async Task PutRoleInstructionsAsync(HttpListenerContext context, string role)
     {
         if (!NameRules.IsValidRoleName(role, allowReserved: false))
@@ -2954,29 +3022,14 @@ internal sealed class LocalServer
             throw new ApiException(409, "role_exists", $"Role '{role}' already exists.");
         }
 
-        _workspace.EnsureRoleFiles(role);
-        var instructionsPath = Path.Combine(dir, "instructions.md");
-        var memoryPath = Path.Combine(dir, "role_memory.md");
-        var sourcePath = _workspace.RoleSourcePath(role);
-        var instructions = GetString(document, "instructions");
-        var memory = GetString(document, "memory");
-        if (instructions is not null)
-        {
-            Atomic.WriteText(instructionsPath, instructions);
-        }
-
-        if (memory is not null)
-        {
-            Atomic.WriteText(memoryPath, memory);
-        }
-
-        var message = await new MessageStore(_workspace).AppendAsync(
-            "system",
-            "roles.changed",
-            "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { RootRelative(instructionsPath), RootRelative(memoryPath), RootRelative(sourcePath) },
-            30000);
-        await WriteJsonAsync(context, 200, new { role, message });
+        var result = await ResourceOperations.SaveRoleAsync(
+            _workspace,
+            role,
+            GetString(document, "instructions"),
+            GetString(document, "memory"),
+            30000,
+            createIfMissing: true);
+        await WriteJsonAsync(context, 200, new { role, created = result.Created, message = result.Message });
     }
 
     private async Task RenameRoleAsync(HttpListenerContext context, string role)
@@ -3978,6 +4031,7 @@ textarea{min-height:120px;resize:vertical}
 button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:8px 10px;font:inherit;cursor:pointer}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
+button:disabled{cursor:not-allowed;opacity:.55}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .row>*{flex:1}
 .row button,.row input[type=checkbox]{flex:0 0 auto}
@@ -3993,6 +4047,7 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 .formbar.assets{grid-template-columns:minmax(130px,1fr) minmax(170px,1fr) auto}
 .management{display:grid;gap:8px}
 .management-fields{display:grid;grid-template-columns:minmax(160px,1fr) minmax(180px,1fr);gap:8px;align-items:end}
+.management-fields.single{grid-template-columns:minmax(180px,1fr)}
 .management-actions{display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
 .management-actions button{min-width:112px}
 .tabs{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -4034,7 +4089,7 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 <div id="chatLog" class="chat-log" aria-live="polite"></div>
 <div class="body stack">
 <textarea id="message" placeholder="Message"></textarea>
-<div class="chat-actions"><label class="critical-toggle"><input id="critical" type="checkbox"> Critical</label><button class="primary" onclick="sendMessage()">Send</button><button onclick="refreshAll()">Refresh</button></div>
+<div class="chat-actions"><label class="critical-toggle"><input id="critical" type="checkbox"> Critical</label><button class="primary" onclick="sendMessage()">Send</button><button onclick="exportChat()">Export</button><button onclick="refreshAll()">Refresh</button></div>
 </div>
 </section>
 <section>
@@ -4045,10 +4100,11 @@ button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}
 </div>
 <div class="body">
 <div id="rolesPanel" class="stack">
-<div class="management"><div class="management-fields"><label class="field required"><span>Role</span><select id="roleSelect" required onchange="loadRole()"></select></label><label class="field required"><span>Name</span><input id="roleName" required placeholder="new-role"></label></div><div class="management-actions"><button onclick="copyRolePrompt()">Copy prompt</button><button onclick="renameRole()">Rename</button><button onclick="addRole()">Add new role</button><button class="danger" onclick="deleteRole()">Delete</button></div></div>
-<label class="field"><span>Instructions</span><textarea id="roleInstructions"></textarea></label>
-<label class="field"><span>Memory</span><textarea id="roleMemory"></textarea></label>
-<div class="row"><button onclick="saveRoleInstructions()">Save instructions</button><button onclick="saveRoleMemory()">Save memory</button></div>
+<div class="management"><div class="management-fields single"><label class="field required"><span>Role</span><select id="roleSelect" required onchange="loadRole()"></select></label></div><div class="management-actions"><button onclick="copyRolePrompt()">Copy prompt</button><button class="danger" onclick="deleteRole()">Delete</button></div></div>
+<div class="management"><div class="management-fields single"><label class="field required"><span>Name</span><input id="roleName" required placeholder="new-role" oninput="updateRoleButtonState()"></label></div><div class="management-actions"><button id="addRoleButton" onclick="addRole()">Add new</button><button id="renameRoleButton" onclick="renameRole()">Rename existing</button></div></div>
+<label class="field"><span>Instructions</span><textarea id="roleInstructions" oninput="updateRoleButtonState()"></textarea></label>
+<label class="field"><span>Memory</span><textarea id="roleMemory" oninput="updateRoleButtonState()"></textarea></label>
+<div class="row"><button id="saveRoleButton" class="primary" onclick="saveRole()" disabled>Save</button><button onclick="clearRoleFields()">Clear</button></div>
 </div>
 <div id="goalsPanel" class="stack" hidden>
 <div class="management"><div class="management-fields"><label class="field required"><span>Goal</span><select id="goalSelect" required onchange="loadGoal()"></select></label><label class="field required"><span>Name</span><input id="goalName" required placeholder="goal.md"></label></div><div class="management-actions"><button onclick="renameGoal()">Rename</button><button onclick="addGoal()">Add new goal</button><button class="danger" onclick="deleteGoal()">Delete</button></div></div>
@@ -4068,6 +4124,8 @@ const $=id=>document.getElementById(id);
 let chatCursor=null;
 let chatMessageIds=new Set();
 let currentRolePrompt='';
+let roleBaseline={role:'',instructions:'',memory:''};
+let roleNames=new Set();
 function setStatus(text){$('status').textContent=text}
 async function api(path, options){const r=await fetch(path, options); if(!r.ok){throw new Error(await r.text())} return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function text(value){return value==null?'':String(value)}
@@ -4080,17 +4138,23 @@ async function refreshChat(){const state=chatScrollState(); const data=await api
 async function loadNewMessages(){const state=chatScrollState(); const query='/api/messages?includeSystem=true&waitMs=0'+(chatCursor?'&cursor='+encodeURIComponent(chatCursor):''); const data=await api(query); renderChat(data.messages||[],!chatCursor); chatCursor=data.nextCursor||chatCursor; restoreChatScroll(state)}
 async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets(),refreshChat()]); setStatus('Refreshed')}
 async function sendMessage(){const state=chatScrollState(); const data=await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; renderChat([data.message],false); chatCursor=data.nextCursor||data.message?.id||chatCursor; restoreChatScroll(state); setStatus('Sent')}
+async function exportChat(){const data=await api('/api/export-html',{method:'POST'}); setStatus('Exported '+text(data.path))}
 function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
 function replaceOptions(select, values){select.textContent=''; for(const value of values){const option=document.createElement('option'); option.value=value; option.textContent=value; select.appendChild(option)}}
 function requiredValue(id){const element=$(id); const value=element.value.trim(); if(!value){element.reportValidity?.(); element.focus(); return null} return value}
-async function loadRoles(selected){const current=selected||$('roleSelect').value; const data=await api('/api/roles'); const roles=data.roles||[]; replaceOptions($('roleSelect'),roles.map(r=>r.role)); if(current && roles.some(r=>r.role===current)){$('roleSelect').value=current} if(roles.length) await loadRole(); else {currentRolePrompt=''; $('roleName').value=''; $('roleInstructions').value=''; $('roleMemory').value=''}}
-async function loadRole(){const role=$('roleSelect').value; if(!role){currentRolePrompt=''; return} const data=await api('/api/roles/'+encodeURIComponent(role)); $('roleName').value=data.role; $('roleInstructions').value=data.instructions; $('roleMemory').value=data.memory; currentRolePrompt=text(data.joinPrompt)}
+function roleDraft(){return {role:$('roleName').value.trim(),instructions:$('roleInstructions').value,memory:$('roleMemory').value}}
+function hasSelectedRole(){return roleBaseline.role&&roleNames.has(roleBaseline.role)}
+function roleContentChanged(){const draft=roleDraft(); return draft.instructions!==roleBaseline.instructions||draft.memory!==roleBaseline.memory}
+function setRoleDraft(role,instructions,memory){$('roleName').value=text(role); $('roleInstructions').value=text(instructions); $('roleMemory').value=text(memory); roleBaseline={role:text(role),instructions:text(instructions),memory:text(memory)}; updateRoleButtonState()}
+function updateRoleButtonState(){const draft=roleDraft(); const hasName=!!draft.role; const targetExists=roleNames.has(draft.role); const selected=hasSelectedRole(); const saveButton=$('saveRoleButton'); const addButton=$('addRoleButton'); const renameButton=$('renameRoleButton'); if(saveButton)saveButton.disabled=!selected||!roleContentChanged(); if(addButton)addButton.disabled=!hasName||targetExists; if(renameButton)renameButton.disabled=!selected||!hasName||draft.role===roleBaseline.role||targetExists}
+async function loadRoles(selected){const current=selected||$('roleSelect').value; const data=await api('/api/roles'); const roles=data.roles||[]; roleNames=new Set(roles.map(r=>r.role)); replaceOptions($('roleSelect'),roles.map(r=>r.role)); if(current && roleNames.has(current)){$('roleSelect').value=current} if(roles.length) await loadRole(); else {currentRolePrompt=''; setRoleDraft('','','')}}
+async function loadRole(){const role=$('roleSelect').value; if(!role){currentRolePrompt=''; setRoleDraft('','',''); return} const data=await api('/api/roles/'+encodeURIComponent(role)); setRoleDraft(data.role,data.instructions,data.memory); currentRolePrompt=text(data.joinPrompt)}
 async function copyText(value){if(navigator.clipboard?.writeText){try{await navigator.clipboard.writeText(value); return}catch{}} const area=document.createElement('textarea'); area.value=value; area.setAttribute('readonly',''); area.style.position='fixed'; area.style.left='-9999px'; document.body.appendChild(area); area.select(); const ok=document.execCommand('copy'); area.remove(); if(!ok)throw new Error('Clipboard copy failed')}
 async function copyRolePrompt(){const role=$('roleSelect').value; if(!role)return; if(!currentRolePrompt)await loadRole(); await copyText(currentRolePrompt); setStatus('Copied prompt for '+role)}
-async function addRole(){const role=requiredValue('roleName'); if(!role)return; await api('/api/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role,instructions:$('roleInstructions').value,memory:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
-async function renameRole(){const role=$('roleSelect').value; const next=requiredValue('roleName'); if(!role||!next)return; await api('/api/roles/'+encodeURIComponent(role)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:next})}); await loadRoles(next); await loadNewMessages()}
-async function saveRoleInstructions(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/instructions',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleInstructions').value})}); await loadRoles(role); await loadNewMessages()}
-async function saveRoleMemory(){const role=$('roleSelect').value; if(!role)return; await api('/api/roles/'+encodeURIComponent(role)+'/memory',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('roleMemory').value})}); await loadRoles(role); await loadNewMessages()}
+async function addRole(){const draft=roleDraft(); const role=requiredValue('roleName'); if(!role||roleNames.has(role))return; await api('/api/roles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role,instructions:draft.instructions,memory:draft.memory})}); await loadRoles(role); await loadNewMessages(); setStatus('Created '+role)}
+async function renameRole(){const role=roleBaseline.role; const next=requiredValue('roleName'); if(!role||!next||next===role||roleNames.has(next))return; const draft=roleDraft(); const previousInstructions=roleBaseline.instructions; const previousMemory=roleBaseline.memory; const hadContentChanges=roleContentChanged(); await api('/api/roles/'+encodeURIComponent(role)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:next})}); await loadRoles(next); if(hadContentChanges){$('roleInstructions').value=draft.instructions; $('roleMemory').value=draft.memory; roleBaseline={role:next,instructions:previousInstructions,memory:previousMemory}; updateRoleButtonState()} await loadNewMessages(); setStatus('Renamed '+role+' to '+next)}
+async function saveRole(){const draft=roleDraft(); const role=roleBaseline.role; if(!role)return; await api('/api/roles/'+encodeURIComponent(role),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({instructions:draft.instructions,memory:draft.memory})}); await loadRoles(role); await loadNewMessages(); setStatus('Saved '+role)}
+function clearRoleFields(){if(!confirm('Clear role fields?'))return; currentRolePrompt=''; $('roleSelect').selectedIndex=-1; setRoleDraft('','',''); $('roleName').focus()}
 async function deleteRole(){const role=$('roleSelect').value; if(role){await api('/api/roles/'+encodeURIComponent(role),{method:'DELETE'}); await refreshAll()}}
 let goalsCache=[];
 function statusText(status){return status==='done'?'Done':'Incomplete'}

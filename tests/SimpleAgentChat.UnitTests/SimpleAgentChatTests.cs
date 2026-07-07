@@ -21,7 +21,7 @@ internal static class SimpleAgentChatTests
             ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
             ("role join prompt clearly explains how to join", TestRoleJoinPromptIsClear),
             ("resource operations manage roles goals and assets", TestResourceOperationsManageFiles),
-            ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
+            ("ui shell exposes single role save, export, and management controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
             ("goal status store computes current role completion", TestGoalStatusStore),
             ("goal edit guidance resets approvals", TestGoalEditGuidanceResetsApprovals)
@@ -347,9 +347,24 @@ internal static class SimpleAgentChatTests
             AssertEqual("roles.memory.changed", updateRoleMessages[0].Kind, "role memory update message kind");
             Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "role_memory.md")).Contains("Updated durable note.", StringComparison.Ordinal), "role memory should update");
 
+            var saveExistingRole = await ResourceOperations.SaveRoleAsync(workspace, "observer", "# Observer\n\nSaved instructions.\n", "# Role Memory\n\nSaved memory.\n", 0, createIfMissing: false);
+            Assert(!saveExistingRole.Created, "role save should overwrite existing role");
+            AssertEqual("roles.changed", saveExistingRole.Message.Kind, "role save existing message kind");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "instructions.md")).Contains("Saved instructions.", StringComparison.Ordinal), "role save should overwrite instructions");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "role_memory.md")).Contains("Saved memory.", StringComparison.Ordinal), "role save should overwrite memory");
+
             var removedRole = await ResourceOperations.RemoveRoleAsync(workspace, "observer", 0);
             AssertEqual("roles.deleted", removedRole.Kind, "role remove message kind");
             Assert(!Directory.Exists(workspace.RoleDirectory("observer")), "role directory should be removed");
+
+            var saveNewRole = await ResourceOperations.SaveRoleAsync(workspace, "observer", "# Observer\n\nNew instructions.\n", "# Role Memory\n\nNew memory.\n", 0, createIfMissing: true);
+            Assert(saveNewRole.Created, "role save should create missing role");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "instructions.md")).Contains("New instructions.", StringComparison.Ordinal), "role save should create instructions");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "role_memory.md")).Contains("New memory.", StringComparison.Ordinal), "role save should create memory");
+
+            var removedSavedRole = await ResourceOperations.RemoveRoleAsync(workspace, "observer", 0);
+            AssertEqual("roles.deleted", removedSavedRole.Kind, "saved role remove message kind");
+            Assert(!Directory.Exists(workspace.RoleDirectory("observer")), "saved role directory should be removed");
 
             var goalSourcePath = Path.Combine(root, "release-source.md");
             File.WriteAllText(goalSourcePath, "# Release\n\nShip it.\n");
@@ -437,7 +452,22 @@ internal static class SimpleAgentChatTests
 
     private static Task TestUiShellManagementControls()
     {
-        Assert(UiShell.Html.Contains("Add new role", StringComparison.Ordinal), "role add button missing");
+        Assert(UiShell.Html.Contains("onclick=\"exportChat()\"", StringComparison.Ordinal), "chat export button missing");
+        Assert(UiShell.Html.Contains("api('/api/export-html',{method:'POST'}", StringComparison.Ordinal), "chat export endpoint call missing");
+        Assert(UiShell.Html.Contains("id=\"saveRoleButton\"", StringComparison.Ordinal), "role save button missing");
+        Assert(UiShell.Html.Contains("onclick=\"saveRole()\"", StringComparison.Ordinal), "role save action missing");
+        Assert(UiShell.Html.Contains("id=\"addRoleButton\"", StringComparison.Ordinal), "role add button missing");
+        Assert(UiShell.Html.Contains("Add new", StringComparison.Ordinal), "role add label missing");
+        Assert(UiShell.Html.Contains("id=\"renameRoleButton\"", StringComparison.Ordinal), "role rename button missing");
+        Assert(UiShell.Html.Contains("Rename existing", StringComparison.Ordinal), "role rename label missing");
+        Assert(UiShell.Html.Contains("updateRoleButtonState()", StringComparison.Ordinal), "role dirty-state action missing");
+        Assert(UiShell.Html.Contains("clearRoleFields()", StringComparison.Ordinal), "role clear action missing");
+        Assert(UiShell.Html.Contains("confirm('Clear role fields?')", StringComparison.Ordinal), "role clear confirmation missing");
+        Assert(UiShell.Html.Contains("roleNames.has(draft.role)", StringComparison.Ordinal), "role name existence check missing");
+        Assert(UiShell.Html.Contains("draft.role===roleBaseline.role", StringComparison.Ordinal), "role rename same-name disable check missing");
+        Assert(UiShell.Html.Contains("const role=roleBaseline.role", StringComparison.Ordinal), "role save should target selected role");
+        Assert(UiShell.Html.Contains("method:'PUT'", StringComparison.Ordinal), "role save should use update endpoint");
+        Assert(UiShell.Html.Contains("method:'POST'", StringComparison.Ordinal), "role add should use create endpoint");
         Assert(UiShell.Html.Contains("renameRole()", StringComparison.Ordinal), "role rename action missing");
         Assert(UiShell.Html.Contains("Copy prompt", StringComparison.Ordinal), "role copy prompt button missing");
         Assert(UiShell.Html.Contains("copyRolePrompt()", StringComparison.Ordinal), "role copy prompt action missing");
@@ -463,7 +493,11 @@ internal static class SimpleAgentChatTests
         Assert(UiShell.Html.Contains("critical-toggle", StringComparison.Ordinal), "critical checkbox styling missing");
         Assert(!UiShell.Html.Contains("<iframe", StringComparison.OrdinalIgnoreCase), "chat UI should not use iframe");
         Assert(!UiShell.Html.Contains("chatFrame", StringComparison.Ordinal), "chat UI should not depend on chatFrame");
-        Assert(!UiShell.Html.Contains("onclick=\"saveRole()\"", StringComparison.Ordinal), "role save should not create implicitly");
+        Assert(!UiShell.Html.Contains("Add new role", StringComparison.Ordinal), "role add button should be replaced by single save");
+        Assert(!UiShell.Html.Contains("Save instructions", StringComparison.Ordinal), "separate instruction save should be removed");
+        Assert(!UiShell.Html.Contains("Save memory", StringComparison.Ordinal), "separate memory save should be removed");
+        Assert(!UiShell.Html.Contains("saveRoleInstructions", StringComparison.Ordinal), "separate instruction save action should be removed");
+        Assert(!UiShell.Html.Contains("saveRoleMemory", StringComparison.Ordinal), "separate memory save action should be removed");
         Assert(!UiShell.Html.Contains("formbar manage", StringComparison.Ordinal), "management buttons should not share the field row");
         Assert(!UiShell.Html.Contains("setInterval(refreshChat,5000)", StringComparison.Ordinal), "chat should not depend on fixed refresh polling when events are available");
         return Task.CompletedTask;
