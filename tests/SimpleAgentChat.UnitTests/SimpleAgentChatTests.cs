@@ -12,6 +12,7 @@ internal static class SimpleAgentChatTests
             ("say parser keeps inline markdown literal after first token", TestSayParser),
             ("fetch parser enforces cursor and wait rules", TestFetchParser),
             ("goal parser handles status, mark, and recheck forms", TestGoalParser),
+            ("role and asset parsers handle resource management forms", TestRoleAndAssetParsers),
             ("serve parser handles port and browser options", TestServeParser),
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
             ("markdown renderer covers common chat shapes", TestMarkdownCommonShapes),
@@ -19,6 +20,7 @@ internal static class SimpleAgentChatTests
             ("initialization moves legacy root how-to-chat guide", TestInitializationMovesLegacyHowToChat),
             ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
             ("role join prompt clearly explains how to join", TestRoleJoinPromptIsClear),
+            ("resource operations manage roles goals and assets", TestResourceOperationsManageFiles),
             ("ui shell exposes dedicated add rename and asset delete controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
             ("goal status store computes current role completion", TestGoalStatusStore),
@@ -96,6 +98,24 @@ internal static class SimpleAgentChatTests
 
     private static Task TestGoalParser()
     {
+        var list = GoalArgs.Parse(new[] { "list", "--json" });
+        AssertEqual("list", list.Action, "list action");
+        Assert(list.Json, "list json");
+
+        var add = GoalArgs.Parse(new[] { "add", "release.md", "--from", "goal.md", "--wait-ms", "9" });
+        AssertEqual("add", add.Action, "add action");
+        AssertEqual("release.md", add.GoalName, "add goal");
+        AssertEqual("goal.md", add.FilePath, "add file");
+        AssertEqual(9, add.WaitMs, "add wait");
+
+        var update = GoalArgs.Parse(new[] { "update", "release.md", "--from", "goal2.md" });
+        AssertEqual("update", update.Action, "update action");
+        AssertEqual("goal2.md", update.FilePath, "update file");
+
+        var remove = GoalArgs.Parse(new[] { "remove", "release.md", "--wait-ms", "4" });
+        AssertEqual("remove", remove.Action, "remove action");
+        AssertEqual(4, remove.WaitMs, "remove wait");
+
         var status = GoalArgs.Parse(new[] { "status", "release.md", "--json" });
         AssertEqual("status", status.Action, "status action");
         AssertEqual("release.md", status.GoalName, "status goal");
@@ -110,6 +130,49 @@ internal static class SimpleAgentChatTests
         AssertEqual("recheck", recheck.Action, "recheck action");
         AssertEqual("--reason text", recheck.Reason, "recheck reason");
         AssertEqual(7, recheck.WaitMs, "recheck wait");
+        AssertThrows<CliException>(() => GoalArgs.Parse(new[] { "add", "release.md" }), "goal add requires file");
+        AssertThrows<CliException>(() => GoalArgs.Parse(new[] { "done", "implementer" }), "done requires goal");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestRoleAndAssetParsers()
+    {
+        var roleList = RoleCommandArgs.Parse(new[] { "list", "--json" });
+        AssertEqual("list", roleList.Action, "role list action");
+        Assert(roleList.Json, "role list json");
+
+        var roleAdd = RoleCommandArgs.Parse(new[] { "add", "observer", "--instructions", "instructions.md", "--memory", "memory.md", "--wait-ms", "8" });
+        AssertEqual("add", roleAdd.Action, "role add action");
+        AssertEqual("observer", roleAdd.Role, "role add role");
+        AssertEqual("instructions.md", roleAdd.InstructionsFile, "role add instructions");
+        AssertEqual("memory.md", roleAdd.MemoryFile, "role add memory");
+        AssertEqual(8, roleAdd.WaitMs, "role add wait");
+
+        var roleUpdate = RoleCommandArgs.Parse(new[] { "update", "observer", "--memory", "memory.md" });
+        AssertEqual("update", roleUpdate.Action, "role update action");
+        AssertEqual("memory.md", roleUpdate.MemoryFile, "role update memory");
+
+        var roleRemove = RoleCommandArgs.Parse(new[] { "remove", "observer" });
+        AssertEqual("remove", roleRemove.Action, "role remove action");
+        AssertEqual("observer", roleRemove.Role, "role remove role");
+
+        var assetList = AssetCommandArgs.Parse(new[] { "list", "--json" });
+        AssertEqual("list", assetList.Action, "asset list action");
+        Assert(assetList.Json, "asset list json");
+
+        var assetAdd = AssetCommandArgs.Parse(new[] { "add", "report.md", "--from", "report.md" });
+        AssertEqual("add", assetAdd.Action, "asset add action");
+        AssertEqual("report.md", assetAdd.Name, "asset add name");
+        AssertEqual("report.md", assetAdd.FilePath, "asset add file");
+
+        var assetUpdate = AssetCommandArgs.Parse(new[] { "update", "report.md", "--from", "updated.md" });
+        AssertEqual("update", assetUpdate.Action, "asset update action");
+
+        var assetRemove = AssetCommandArgs.Parse(new[] { "remove", "report.md" });
+        AssertEqual("remove", assetRemove.Action, "asset remove action");
+
+        AssertThrows<CliException>(() => RoleCommandArgs.Parse(new[] { "update", "observer" }), "role update requires a file option");
+        AssertThrows<CliException>(() => AssetCommandArgs.Parse(new[] { "add", "report.md" }), "asset add requires file");
         return Task.CompletedTask;
     }
 
@@ -160,6 +223,8 @@ internal static class SimpleAgentChatTests
             Assert(reviewerInstructions.Contains("Perform a thorough code review.", StringComparison.Ordinal), "reviewer should ask for a thorough code review");
             Assert(reviewerInstructions.Contains("gaps the implementer may have missed", StringComparison.Ordinal), "reviewer should look for implementer gaps");
             Assert(reviewerInstructions.Contains("ask a question in the chat", StringComparison.Ordinal), "reviewer should ask questions when unclear");
+            Assert(reviewerInstructions.Contains("keep polling every 2-3 minutes while reviewing", StringComparison.Ordinal), "reviewer should keep polling during work");
+            Assert(reviewerInstructions.Contains("Announce review findings or shared-state changes", StringComparison.Ordinal), "reviewer should announce meaningful findings");
 
             var reviewerSource = workspace.RoleSourcePath("reviewer");
             Assert(File.Exists(reviewerSource), "reviewer role source copy should exist");
@@ -205,8 +270,10 @@ internal static class SimpleAgentChatTests
         Assert(block.Contains("until a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
         Assert(block.Contains("Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added", StringComparison.Ordinal), "post-goal polling guidance missing");
         Assert(!block.Contains("until the goal is done", StringComparison.Ordinal), "goal completion should not be a polling stop condition");
+        Assert(block.Contains("at least every 2-3 minutes while you are doing actual work", StringComparison.Ordinal), "during-work polling cadence missing");
         Assert(block.Contains("inform the chat when you complete a large or important chunk of work", StringComparison.Ordinal), "important progress update guidance missing");
-        Assert(block.Contains("Keep these progress updates concise and avoid spamming routine activity", StringComparison.Ordinal), "anti-spam progress guidance missing");
+        Assert(block.Contains("find anything of interest, are about to make a big change, or want the opinion of other participants", StringComparison.Ordinal), "meaningful interest guidance missing");
+        Assert(block.Contains("Keep these updates concise and avoid spamming routine activity", StringComparison.Ordinal), "anti-spam progress guidance missing");
         Assert(block.Contains("When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is", StringComparison.Ordinal), "handoff clarity guidance missing");
         Assert(block.Contains("timedOut: true", StringComparison.Ordinal), "timedOut guidance missing");
         return Task.CompletedTask;
@@ -233,8 +300,10 @@ internal static class SimpleAgentChatTests
             Assert(prompt.Contains("fetch --wait-ms 0 --json", StringComparison.Ordinal), "prompt should include immediate first fetch command");
             Assert(prompt.Contains("announce yourself briefly", StringComparison.Ordinal), "prompt should include conditional self-announcement");
             Assert(prompt.Contains("keep polling/fetching for other messages", StringComparison.Ordinal), "prompt should include ongoing polling guidance");
+            Assert(prompt.Contains("at least every 2-3 minutes while doing actual work", StringComparison.Ordinal), "prompt should include during-work polling cadence");
             Assert(prompt.Contains("fetch <nextCursor> --wait-ms 600000 --json", StringComparison.Ordinal), "prompt should include long-poll command");
             Assert(prompt.Contains("If a long poll returns no messages or times out, continue polling", StringComparison.Ordinal), "prompt should include empty long-poll guidance");
+            Assert(prompt.Contains("find anything of interest, are about to make a big change, or want the opinion of other participants", StringComparison.Ordinal), "prompt should include meaningful announcement guidance");
             Assert(prompt.Contains("goal done reviewer <goal_file_name>", StringComparison.Ordinal), "prompt should include role-specific goal completion command");
         }
         finally
@@ -246,6 +315,89 @@ internal static class SimpleAgentChatTests
         }
 
         return Task.CompletedTask;
+    }
+
+    private static async Task TestResourceOperationsManageFiles()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "simpleagentchat.cs"), "Console.WriteLine(\"role runner smoke\");\n");
+            var workspace = ChatWorkspace.Initialize(root);
+
+            var instructionsPath = Path.Combine(root, "observer-instructions.md");
+            var memoryPath = Path.Combine(root, "observer-memory.md");
+            File.WriteAllText(instructionsPath, "# Observer\n\nWatch coordination.\n");
+            File.WriteAllText(memoryPath, "# Role Memory\n\nRemember handoffs.\n");
+
+            var addRoleArgs = RoleCommandArgs.Parse(new[] { "add", "observer", "--instructions", instructionsPath, "--memory", memoryPath, "--wait-ms", "0" });
+            var addRoleMessages = await ResourceOperations.AddRoleAsync(workspace, addRoleArgs);
+            AssertEqual(1, addRoleMessages.Count, "role add message count");
+            AssertEqual("roles.changed", addRoleMessages[0].Kind, "role add message kind");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "instructions.md")).Contains("Watch coordination.", StringComparison.Ordinal), "role instructions should be created from file");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "role_memory.md")).Contains("Remember handoffs.", StringComparison.Ordinal), "role memory should be created from file");
+            Assert(ResourceOperations.ListRoles(workspace).Any(role => role.Role == "observer"), "role list should include added role");
+
+            var updatedMemoryPath = Path.Combine(root, "observer-memory-updated.md");
+            File.WriteAllText(updatedMemoryPath, "# Role Memory\n\nUpdated durable note.\n");
+            var updateRoleArgs = RoleCommandArgs.Parse(new[] { "update", "observer", "--memory", updatedMemoryPath, "--wait-ms", "0" });
+            var updateRoleMessages = await ResourceOperations.UpdateRoleAsync(workspace, updateRoleArgs);
+            AssertEqual(1, updateRoleMessages.Count, "role update message count");
+            AssertEqual("roles.memory.changed", updateRoleMessages[0].Kind, "role memory update message kind");
+            Assert(File.ReadAllText(Path.Combine(workspace.RoleDirectory("observer"), "role_memory.md")).Contains("Updated durable note.", StringComparison.Ordinal), "role memory should update");
+
+            var removedRole = await ResourceOperations.RemoveRoleAsync(workspace, "observer", 0);
+            AssertEqual("roles.deleted", removedRole.Kind, "role remove message kind");
+            Assert(!Directory.Exists(workspace.RoleDirectory("observer")), "role directory should be removed");
+
+            var goalSourcePath = Path.Combine(root, "release-source.md");
+            File.WriteAllText(goalSourcePath, "# Release\n\nShip it.\n");
+            var addGoal = await ResourceOperations.AddGoalAsync(workspace, "release.md", goalSourcePath, 0);
+            AssertEqual("goals.changed", addGoal.Kind, "goal add message kind");
+            Assert(File.ReadAllText(workspace.GoalPath("release.md")).Contains("Ship it.", StringComparison.Ordinal), "goal file should be created");
+            Assert(ResourceOperations.ListGoals(workspace).Any(goal => goal.Name == "release.md"), "goal list should include added goal");
+
+            var goals = new GoalStatusStore(workspace);
+            await goals.MarkRoleStatusAsync("release.md", "implementer", "done", 0);
+            await goals.MarkRoleStatusAsync("release.md", "reviewer", "done", 0);
+            Assert(goals.GetStatus("release.md").Complete, "goal should be complete before update");
+
+            var updatedGoalPath = Path.Combine(root, "release-updated.md");
+            File.WriteAllText(updatedGoalPath, "# Release\n\nChanged scope.\n");
+            var updateGoal = await ResourceOperations.UpdateGoalAsync(workspace, "release.md", updatedGoalPath, 0);
+            AssertEqual("goals.changed", updateGoal.Kind, "goal update message kind");
+            Assert(updateGoal.Markdown.Contains("reprocess the goal", StringComparison.Ordinal), "goal update should ask agents to reprocess");
+            var resetStatus = goals.GetStatus("release.md");
+            Assert(!resetStatus.Complete, "goal update should reset completion");
+            Assert(resetStatus.Roles.All(role => role.Status == "undone"), "goal update should mark all roles undone");
+
+            var removeGoal = await ResourceOperations.RemoveGoalAsync(workspace, "release.md", 0);
+            AssertEqual("goals.changed", removeGoal.Kind, "goal remove message kind");
+            Assert(!File.Exists(workspace.GoalPath("release.md")), "goal file should be removed");
+            Assert(!File.Exists(workspace.GoalStatusPath("release.md")), "goal status file should be removed");
+
+            var assetSource = Path.Combine(root, "asset-source.txt");
+            File.WriteAllText(assetSource, "first");
+            ResourceOperations.AddAsset(workspace, "notes.txt", assetSource);
+            AssertEqual("first", File.ReadAllText(workspace.AssetPath("notes.txt")), "asset should be added");
+            Assert(ResourceOperations.ListAssets(workspace).Any(asset => asset.Name == "notes.txt"), "asset list should include added asset");
+
+            var assetUpdate = Path.Combine(root, "asset-updated.txt");
+            File.WriteAllText(assetUpdate, "second");
+            ResourceOperations.UpdateAsset(workspace, "notes.txt", assetUpdate);
+            AssertEqual("second", File.ReadAllText(workspace.AssetPath("notes.txt")), "asset should be updated");
+
+            ResourceOperations.RemoveAsset(workspace, "notes.txt");
+            Assert(!File.Exists(workspace.AssetPath("notes.txt")), "asset should be removed");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
     }
 
     private static Task TestInitializationMovesLegacyHowToChat()

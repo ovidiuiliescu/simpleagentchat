@@ -20,10 +20,22 @@ Agents can also use command-line operations directly:
 dotnet simpleagentchat.cs say <role> <markdown message>
 dotnet simpleagentchat.cs fetch [cursor] [wait-ms]
 dotnet simpleagentchat.cs fetch [--wait-ms <ms>]
+dotnet simpleagentchat.cs role list
+dotnet simpleagentchat.cs role add <role> [--instructions <path>] [--memory <path>]
+dotnet simpleagentchat.cs role update <role> [--instructions <path>] [--memory <path>]
+dotnet simpleagentchat.cs role remove <role>
+dotnet simpleagentchat.cs goal list
+dotnet simpleagentchat.cs goal add <goal_file_name> --from <path>
+dotnet simpleagentchat.cs goal update <goal_file_name> --from <path>
+dotnet simpleagentchat.cs goal remove <goal_file_name>
 dotnet simpleagentchat.cs goal status <goal_file_name>
 dotnet simpleagentchat.cs goal done <role> <goal_file_name>
 dotnet simpleagentchat.cs goal undone <role> <goal_file_name>
 dotnet simpleagentchat.cs goal recheck <goal_file_name> <reason>
+dotnet simpleagentchat.cs asset list
+dotnet simpleagentchat.cs asset add <asset_name> --from <path>
+dotnet simpleagentchat.cs asset update <asset_name> --from <path>
+dotnet simpleagentchat.cs asset remove <asset_name>
 dotnet simpleagentchat.cs export-html
 ```
 
@@ -370,8 +382,8 @@ It explains:
 - agents must track the `nextCursor` returned by `fetch`, not the cursor returned by their own `say`
 - agents must keep listening for new chat messages once they join until a human or system message explicitly tells their role to stop listening; all current goals being done is not a stop condition because new goals can appear
 - agents must use a long wait, such as `fetch <nextCursor> --wait-ms 600000 --json`, when no messages are available yet, and repeat after `timedOut: true` instead of stopping
-- agents must fetch from their latest fetched cursor before each meaningful work step
-- agents should post concise progress updates when large or important chunks of work are completed, even if the whole goal is not done yet, while avoiding routine spam
+- agents must fetch from their latest fetched cursor before each meaningful work step and at least every 2-3 minutes while doing actual work
+- agents should post concise updates when large or important chunks of work are completed, when they find anything of interest, before making big changes, or when they want the opinion of other participants, while avoiding routine spam
 - agents must send a handoff message when their role finishes its part, saying what changed or what work was done and what their conclusion is
 - agents must obey critical `!` messages immediately
 - agents must obey newly fetched `system` messages immediately
@@ -634,25 +646,67 @@ dotnet simpleagentchat.cs export-html
 
 Generates `.simpleagentchat/chat.html` from the canonical message files, prints the generated file path, and exits with code `0`.
 
-This command is for read-only sharing or offline inspection. Normal `serve`, `say`, `goal`, and UI workflows should not regenerate `chat.html`; the live browser UI should render messages through the local server message API instead.
+This command is for read-only sharing or offline inspection. Normal `serve`, `say`, `role`, `goal`, `asset`, and UI workflows should not regenerate `chat.html`; the live browser UI should render messages through the local server message API instead.
+
+### `role`
+
+```powershell
+dotnet simpleagentchat.cs role list [--json]
+dotnet simpleagentchat.cs role add <role> [--instructions <path>] [--memory <path>] [--wait-ms <ms>]
+dotnet simpleagentchat.cs role update <role> [--instructions <path>] [--memory <path>] [--wait-ms <ms>]
+dotnet simpleagentchat.cs role remove <role> [--wait-ms <ms>]
+```
+
+The `role` command manages role directories under `.simpleagentchat/roles/`.
+
+Validation:
+
+- `<role>` must be a safe non-reserved role name.
+- `role add` rejects existing role directories.
+- `role update` requires at least one of `--instructions <path>` or `--memory <path>`.
+- `role update` and `role remove` require an existing role directory.
+- `--instructions` and `--memory` read UTF-8 text from existing local files.
+
+`role list` prints current role names in stable sort order. With `--json`, it returns role metadata including role name, instructions length, memory length, and latest write time.
+
+`role add` creates the role directory, default files, role-local source copy, and role-local runner. If `--instructions` or `--memory` is provided, those files replace the defaults. It appends a `roles.changed` system message and prints the created message id.
+
+`role update` writes the requested role files. Instruction changes append a `roles.changed` system message. Memory changes append a `roles.memory.changed` system message. If both files change, both messages are printed.
+
+`role remove` deletes the role directory, appends a critical `roles.deleted` system message, and prints the created message id.
 
 ### `goal`
 
 ```powershell
+dotnet simpleagentchat.cs goal list [--json]
+dotnet simpleagentchat.cs goal add <goal_file_name> --from <path> [--wait-ms <ms>]
+dotnet simpleagentchat.cs goal update <goal_file_name> --from <path> [--wait-ms <ms>]
+dotnet simpleagentchat.cs goal remove <goal_file_name> [--wait-ms <ms>]
 dotnet simpleagentchat.cs goal done <role> <goal_file_name> [--wait-ms <ms>]
 dotnet simpleagentchat.cs goal undone <role> <goal_file_name> [--wait-ms <ms>]
 dotnet simpleagentchat.cs goal status <goal_file_name> [--json]
 dotnet simpleagentchat.cs goal recheck <goal_file_name> [--wait-ms <ms>] <reason till end of line>
 ```
 
-The `goal` command records and reports public completion agreement for goal files in `.simpleagentchat/goals/`.
+The `goal` command manages goal files in `.simpleagentchat/goals/` and records public completion agreement for those goal files.
 
 Validation:
 
-- `<goal_file_name>` must be a safe goal file name and must exist in `.simpleagentchat/goals/`.
+- `<goal_file_name>` must be a safe goal file name.
+- `goal add` rejects existing goal files.
+- `goal update`, `goal remove`, `goal status`, `goal done`, `goal undone`, and `goal recheck` require an existing goal file.
+- `--from` reads UTF-8 text from an existing local file. `--file` is accepted as an alias when invoking a built DLL directly, but `--from` is preferred because `--file` conflicts with the .NET file-app launcher when running `dotnet simpleagentchat.cs ...`.
 - `<role>` must be a safe role name and must have a current role directory.
 - `goal` is a reserved role name and cannot be used as an agent role.
 - `reason` for `goal recheck` must be non-empty after trimming whitespace.
+
+`goal list` prints current goal file names in stable sort order. With `--json`, it returns goal metadata including length, latest write time, completion status, and per-role status.
+
+`goal add` creates a goal file from `--from`, initializes every current role as `undone` for that goal, appends a `goals.changed` system message, and prints the created message id.
+
+`goal update` replaces the goal file from `--from`, resets every current role to `undone`, appends a `goals.changed` system message that tells agents to reprocess and re-approve the goal, and prints the created message id.
+
+`goal remove` deletes the goal file and any goal status file, appends a `goals.changed` system message, and prints the created message id.
 
 `goal done <role> <goal_file_name>` marks that role's status for the goal as `done`, writes the updated status file, appends a public message from `<role>` with kind `goals.done`, prints the new message cursor/id to stdout, and exits with code `0`.
 
@@ -711,6 +765,33 @@ messageCursor: 20260704T124000.0000001Z-goal-a1b2c3
 ```
 
 For `goal recheck`, options are parsed only before the first reason token. After the reason begins, every remaining token is part of the reason, even if it looks like an option. A `--` delimiter may be used to make the start of the reason explicit and is required when the reason itself starts with `-`.
+
+### `asset`
+
+```powershell
+dotnet simpleagentchat.cs asset list [--json]
+dotnet simpleagentchat.cs asset add <asset_name> --from <path>
+dotnet simpleagentchat.cs asset update <asset_name> --from <path>
+dotnet simpleagentchat.cs asset remove <asset_name>
+```
+
+The `asset` command manages files under `.simpleagentchat/assets/`.
+
+Validation:
+
+- `<asset_name>` must be a safe asset file name.
+- `asset add` rejects existing asset files.
+- `asset update` and `asset remove` require an existing asset file.
+- `--from` reads bytes from an existing local file. `--file` is accepted as an alias when invoking a built DLL directly, but `--from` is preferred because `--file` conflicts with the .NET file-app launcher when running `dotnet simpleagentchat.cs ...`.
+- Asset add and update reject files larger than `25 MiB`.
+
+`asset list` prints current asset file names in stable sort order. With `--json`, it returns asset metadata including length and latest write time.
+
+`asset add` copies the source file to `.simpleagentchat/assets/<asset_name>` and prints the asset name.
+
+`asset update` replaces `.simpleagentchat/assets/<asset_name>` from the source file and prints the asset name.
+
+`asset remove` deletes `.simpleagentchat/assets/<asset_name>` and prints the asset name.
 
 ## Message Model
 
@@ -897,8 +978,8 @@ These rules belong in `.simpleagentchat/HOW_TO_CHAT.md` and should be followed b
 - Do not begin implementation work until the human explicitly says `Start`, unless a prior `Start` already exists in fetched chat history.
 - Once you join, always keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion.
 - If no messages are available yet, run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 600000 --json` and repeat after `timedOut: true`.
-- After joining, always fetch from your latest fetched cursor before each meaningful work step.
-- To improve collaboration, inform the chat when you complete a large or important chunk of work, even if the whole goal is not done yet. Keep these progress updates concise and avoid spamming routine activity.
+- After joining, always fetch from your latest fetched cursor before each meaningful work step and at least every 2-3 minutes while doing actual work.
+- To improve collaboration, inform the chat when you complete a large or important chunk of work, find anything of interest, are about to make a big change, or want the opinion of other participants. Keep these updates concise and avoid spamming routine activity.
 - When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from messages returned by `fetch`.
 - Critical or blocker messages are prefixed with `!`.
@@ -1049,6 +1130,9 @@ A successful v1 should support:
 - The human can add and edit roles.
 - The human can view and edit role memory/thoughts files.
 - The human can upload and view safe asset files.
+- The CLI can list, add, update, and remove roles.
+- The CLI can list, add, update, and remove goals.
+- The CLI can list, add, update, and remove assets.
 - Role and goal changes produce visible `system` messages.
 - Human/UI role memory changes produce visible `system` messages.
 - Agent-authored direct role memory updates do not need to produce `system` messages.

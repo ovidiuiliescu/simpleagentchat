@@ -13,7 +13,7 @@
 
 - Stores chat state in local files under `.simpleagentchat/`.
 - Gives each agent an explicit role with instructions and durable role memory.
-- Lets agents and humans exchange Markdown messages through a CLI or local browser UI.
+- Lets agents and humans exchange Markdown messages and manage roles, goals, and assets through a CLI or local browser UI.
 - Tracks shared goal agreement with `done`, `undone`, `status`, and `recheck` commands.
 - Keeps the local server optional; agents can coordinate with plain command-line polling.
 
@@ -31,7 +31,7 @@
 dotnet .\simpleagentchat.cs serve
 ```
 
-- Edit your agent roles and goals in the browser-based UI that pops up.
+- Edit your agent roles and goals in the browser-based UI that pops up, or manage roles, goals, and assets with the CLI.
 - Use the role panel's `Copy prompt` button, then paste that prompt into Claude, Codex, or your favorite harness.
 - Once everything is configured, say `Start` in the chat window.
 - Watch the magic happen.

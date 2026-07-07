@@ -33,7 +33,7 @@ internal static class Program
         {
             if (args.Length == 0)
             {
-                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|goal|export-html> ...");
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|role|goal|asset|export-html> ...");
             }
 
             ErrorWriter.JsonMode = WantsJsonErrors(args);
@@ -44,7 +44,9 @@ internal static class Program
                 "init" => await Commands.InitAsync(rest),
                 "say" => await Commands.SayAsync(rest),
                 "fetch" => await Commands.FetchAsync(rest),
+                "role" => await Commands.RoleAsync(rest),
                 "goal" => await Commands.GoalAsync(rest),
+                "asset" => await Commands.AssetAsync(rest),
                 "serve" => await Commands.ServeAsync(rest),
                 "export-html" => await Commands.ExportHtmlAsync(rest),
                 _ => throw CliException.Usage("unknown_command", $"Unknown command '{command}'.")
@@ -65,7 +67,7 @@ internal static class Program
     private static bool WantsJsonErrors(string[] args)
     {
         return args.Length > 1 &&
-               (args[0] == "fetch" || args[0] == "goal") &&
+               (args[0] == "fetch" || args[0] == "role" || args[0] == "goal" || args[0] == "asset") &&
                args.Skip(1).Any(arg => arg == "--json");
     }
 }
@@ -143,6 +145,55 @@ internal static class Commands
         return Task.FromResult(0);
     }
 
+    public static async Task<int> RoleAsync(string[] args)
+    {
+        var parsed = RoleCommandArgs.Parse(args);
+        ErrorWriter.JsonMode = parsed.Json;
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+
+        switch (parsed.Action)
+        {
+            case "list":
+            {
+                var roles = ResourceOperations.ListRoles(workspace);
+                if (parsed.Json)
+                {
+                    Console.Out.WriteLine(Json.Text(new { roles }));
+                }
+                else
+                {
+                    foreach (var role in roles)
+                    {
+                        Console.Out.WriteLine(role.Role);
+                    }
+                }
+
+                return 0;
+            }
+            case "add":
+            {
+                var messages = await ResourceOperations.AddRoleAsync(workspace, parsed);
+                WriteMessageIds(messages);
+                return 0;
+            }
+            case "update":
+            {
+                var messages = await ResourceOperations.UpdateRoleAsync(workspace, parsed);
+                WriteMessageIds(messages);
+                return 0;
+            }
+            case "remove":
+            {
+                var message = await ResourceOperations.RemoveRoleAsync(workspace, parsed.Role!, parsed.WaitMs);
+                Console.Out.WriteLine(message.Id);
+                return 0;
+            }
+            default:
+                throw CliException.Usage("usage", "Unknown role subcommand.");
+        }
+    }
+
     public static async Task<int> GoalAsync(string[] args)
     {
         var parsed = GoalArgs.Parse(args);
@@ -153,6 +204,41 @@ internal static class Commands
 
         switch (parsed.Action)
         {
+            case "list":
+            {
+                var reports = ResourceOperations.ListGoals(workspace);
+                if (parsed.Json)
+                {
+                    Console.Out.WriteLine(Json.Text(new { goals = reports }));
+                }
+                else
+                {
+                    foreach (var goal in reports)
+                    {
+                        Console.Out.WriteLine(goal.Name);
+                    }
+                }
+
+                return 0;
+            }
+            case "add":
+            {
+                var message = await ResourceOperations.AddGoalAsync(workspace, parsed.GoalName!, parsed.FilePath!, parsed.WaitMs);
+                Console.Out.WriteLine(message.Id);
+                return 0;
+            }
+            case "update":
+            {
+                var message = await ResourceOperations.UpdateGoalAsync(workspace, parsed.GoalName!, parsed.FilePath!, parsed.WaitMs);
+                Console.Out.WriteLine(message.Id);
+                return 0;
+            }
+            case "remove":
+            {
+                var message = await ResourceOperations.RemoveGoalAsync(workspace, parsed.GoalName!, parsed.WaitMs);
+                Console.Out.WriteLine(message.Id);
+                return 0;
+            }
             case "status":
             {
                 var report = goals.GetStatus(parsed.GoalName!);
@@ -186,6 +272,55 @@ internal static class Commands
         }
     }
 
+    public static Task<int> AssetAsync(string[] args)
+    {
+        var parsed = AssetCommandArgs.Parse(args);
+        ErrorWriter.JsonMode = parsed.Json;
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+
+        switch (parsed.Action)
+        {
+            case "list":
+            {
+                var assets = ResourceOperations.ListAssets(workspace);
+                if (parsed.Json)
+                {
+                    Console.Out.WriteLine(Json.Text(new { assets }));
+                }
+                else
+                {
+                    foreach (var asset in assets)
+                    {
+                        Console.Out.WriteLine(asset.Name);
+                    }
+                }
+
+                return Task.FromResult(0);
+            }
+            case "add":
+            {
+                ResourceOperations.AddAsset(workspace, parsed.Name!, parsed.FilePath!);
+                Console.Out.WriteLine(parsed.Name);
+                return Task.FromResult(0);
+            }
+            case "update":
+            {
+                ResourceOperations.UpdateAsset(workspace, parsed.Name!, parsed.FilePath!);
+                Console.Out.WriteLine(parsed.Name);
+                return Task.FromResult(0);
+            }
+            case "remove":
+            {
+                ResourceOperations.RemoveAsset(workspace, parsed.Name!);
+                Console.Out.WriteLine(parsed.Name);
+                return Task.FromResult(0);
+            }
+            default:
+                throw CliException.Usage("usage", "Unknown asset subcommand.");
+        }
+    }
+
     public static async Task<int> ServeAsync(string[] args)
     {
         var parsed = ServeArgs.Parse(args);
@@ -193,6 +328,21 @@ internal static class Commands
         var workspace = ChatWorkspace.Initialize(root);
         var server = new LocalServer(workspace, parsed.Port, parsed.NoOpen);
         return await server.RunAsync();
+    }
+
+    private static void WriteMessageIds(IReadOnlyList<Message> messages)
+    {
+        if (messages.Count == 1)
+        {
+            Console.Out.WriteLine(messages[0].Id);
+            return;
+        }
+
+        Console.Out.WriteLine($"messageCount: {messages.Count}");
+        foreach (var message in messages)
+        {
+            Console.Out.WriteLine(message.Id);
+        }
     }
 }
 
@@ -434,24 +584,264 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
     }
 }
 
-internal sealed record GoalArgs(string Action, string? Role, string? GoalName, int WaitMs, bool Json, string? Reason)
+internal sealed record RoleCommandArgs(string Action, string? Role, string? InstructionsFile, string? MemoryFile, int WaitMs, bool Json)
+{
+    public static RoleCommandArgs Parse(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs role <list|add|update|remove> ...");
+        }
+
+        var action = args[0] == "delete" ? "remove" : args[0];
+        return action switch
+        {
+            "list" => ParseList(args.Skip(1).ToArray()),
+            "add" => ParseMutation("add", args.Skip(1).ToArray()),
+            "update" => ParseMutation("update", args.Skip(1).ToArray()),
+            "remove" => ParseRemove(args.Skip(1).ToArray()),
+            _ => throw CliException.Usage("usage", $"Unknown role subcommand '{args[0]}'.")
+        };
+    }
+
+    private static RoleCommandArgs ParseList(string[] args)
+    {
+        var json = false;
+        foreach (var token in args)
+        {
+            if (token == "--json")
+            {
+                json = true;
+                continue;
+            }
+
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs role list [--json]");
+        }
+
+        return new RoleCommandArgs("list", null, null, null, 0, json);
+    }
+
+    private static RoleCommandArgs ParseMutation(string action, string[] args)
+    {
+        var waitMs = 30000;
+        string? role = null;
+        string? instructions = null;
+        string? memory = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token == "--instructions")
+            {
+                instructions = RequireValue(args, ref i, "--instructions");
+                continue;
+            }
+
+            if (token == "--memory")
+            {
+                memory = RequireValue(args, ref i, "--memory");
+                continue;
+            }
+
+            if (token == "--wait-ms")
+            {
+                waitMs = CliParsing.ParseWaitMs(RequireValue(args, ref i, "--wait-ms"));
+                continue;
+            }
+
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (role is not null)
+            {
+                throw CliException.Usage("usage", $"Usage: dotnet simpleagentchat.cs role {action} <role> [--instructions <path>] [--memory <path>] [--wait-ms <ms>]");
+            }
+
+            role = token;
+        }
+
+        if (role is null)
+        {
+            throw CliException.Usage("usage", $"role {action} requires a role name.");
+        }
+
+        if (action == "update" && instructions is null && memory is null)
+        {
+            throw CliException.Usage("usage", "role update requires --instructions and/or --memory.");
+        }
+
+        return new RoleCommandArgs(action, role, instructions, memory, waitMs, false);
+    }
+
+    private static RoleCommandArgs ParseRemove(string[] args)
+    {
+        var waitMs = 30000;
+        string? role = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token == "--wait-ms")
+            {
+                waitMs = CliParsing.ParseWaitMs(RequireValue(args, ref i, "--wait-ms"));
+                continue;
+            }
+
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (role is not null)
+            {
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs role remove <role> [--wait-ms <ms>]");
+            }
+
+            role = token;
+        }
+
+        if (role is null)
+        {
+            throw CliException.Usage("usage", "role remove requires a role name.");
+        }
+
+        return new RoleCommandArgs("remove", role, null, null, waitMs, false);
+    }
+
+    private static string RequireValue(string[] args, ref int index, string option)
+    {
+        if (index + 1 >= args.Length)
+        {
+            throw CliException.Usage("usage", $"{option} requires a value.");
+        }
+
+        return args[++index];
+    }
+}
+
+internal sealed record GoalArgs(string Action, string? Role, string? GoalName, int WaitMs, bool Json, string? Reason, string? FilePath)
 {
     public static GoalArgs Parse(string[] args)
     {
         if (args.Length == 0)
         {
-            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs goal <status|done|undone|recheck> ...");
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs goal <list|add|update|remove|status|done|undone|recheck> ...");
         }
 
-        var action = args[0];
+        var action = args[0] == "delete" ? "remove" : args[0];
         return action switch
         {
+            "list" => ParseList(args.Skip(1).ToArray()),
+            "add" => ParseFileMutation("add", args.Skip(1).ToArray()),
+            "update" => ParseFileMutation("update", args.Skip(1).ToArray()),
+            "remove" => ParseRemove(args.Skip(1).ToArray()),
             "status" => ParseStatus(args.Skip(1).ToArray()),
             "done" => ParseMark("done", args.Skip(1).ToArray()),
             "undone" => ParseMark("undone", args.Skip(1).ToArray()),
             "recheck" => ParseRecheck(args.Skip(1).ToArray()),
-            _ => throw CliException.Usage("usage", $"Unknown goal subcommand '{action}'.")
+            _ => throw CliException.Usage("usage", $"Unknown goal subcommand '{args[0]}'.")
         };
+    }
+
+    private static GoalArgs ParseList(string[] args)
+    {
+        var json = false;
+        foreach (var token in args)
+        {
+            if (token == "--json")
+            {
+                json = true;
+                continue;
+            }
+
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs goal list [--json]");
+        }
+
+        return new GoalArgs("list", null, null, 0, json, null, null);
+    }
+
+    private static GoalArgs ParseFileMutation(string action, string[] args)
+    {
+        var waitMs = 30000;
+        string? goal = null;
+        string? file = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token is "--from" or "--file")
+            {
+                file = RequireValue(args, ref i, token);
+                continue;
+            }
+
+            if (token == "--wait-ms")
+            {
+                waitMs = CliParsing.ParseWaitMs(RequireValue(args, ref i, "--wait-ms"));
+                continue;
+            }
+
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (goal is not null)
+            {
+                throw CliException.Usage("usage", $"Usage: dotnet simpleagentchat.cs goal {action} <goal_file_name> --from <path> [--wait-ms <ms>]");
+            }
+
+            goal = token;
+        }
+
+        if (goal is null)
+        {
+            throw CliException.Usage("usage", $"goal {action} requires a goal file name.");
+        }
+
+        if (file is null)
+        {
+            throw CliException.Usage("usage", $"goal {action} requires --from <path>.");
+        }
+
+        return new GoalArgs(action, null, goal, waitMs, false, null, file);
+    }
+
+    private static GoalArgs ParseRemove(string[] args)
+    {
+        var waitMs = 30000;
+        string? goal = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token == "--wait-ms")
+            {
+                waitMs = CliParsing.ParseWaitMs(RequireValue(args, ref i, "--wait-ms"));
+                continue;
+            }
+
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (goal is not null)
+            {
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs goal remove <goal_file_name> [--wait-ms <ms>]");
+            }
+
+            goal = token;
+        }
+
+        if (goal is null)
+        {
+            throw CliException.Usage("usage", "goal remove requires a goal file name.");
+        }
+
+        return new GoalArgs("remove", null, goal, waitMs, false, null, null);
     }
 
     private static GoalArgs ParseStatus(string[] args)
@@ -484,7 +874,7 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
             throw CliException.Usage("usage", "goal status requires a goal file name.");
         }
 
-        return new GoalArgs("status", null, goal, 0, json, null);
+        return new GoalArgs("status", null, goal, 0, json, null, null);
     }
 
     private static GoalArgs ParseMark(string action, string[] args)
@@ -518,7 +908,7 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
             throw CliException.Usage("usage", $"Usage: dotnet simpleagentchat.cs goal {action} <role> <goal_file_name> [--wait-ms <ms>]");
         }
 
-        return new GoalArgs(action, positionals[0], positionals[1], waitMs, false, null);
+        return new GoalArgs(action, positionals[0], positionals[1], waitMs, false, null, null);
     }
 
     private static GoalArgs ParseRecheck(string[] args)
@@ -572,7 +962,131 @@ internal sealed record GoalArgs(string Action, string? Role, string? GoalName, i
             throw CliException.Validation("empty_reason", "goal recheck reason must be non-empty.");
         }
 
-        return new GoalArgs("recheck", null, goal, waitMs, false, reason);
+        return new GoalArgs("recheck", null, goal, waitMs, false, reason, null);
+    }
+
+    private static string RequireValue(string[] args, ref int index, string option)
+    {
+        if (index + 1 >= args.Length)
+        {
+            throw CliException.Usage("usage", $"{option} requires a value.");
+        }
+
+        return args[++index];
+    }
+}
+
+internal sealed record AssetCommandArgs(string Action, string? Name, string? FilePath, bool Json)
+{
+    public static AssetCommandArgs Parse(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs asset <list|add|update|remove> ...");
+        }
+
+        var action = args[0] == "delete" ? "remove" : args[0];
+        return action switch
+        {
+            "list" => ParseList(args.Skip(1).ToArray()),
+            "add" => ParseFileMutation("add", args.Skip(1).ToArray()),
+            "update" => ParseFileMutation("update", args.Skip(1).ToArray()),
+            "remove" => ParseRemove(args.Skip(1).ToArray()),
+            _ => throw CliException.Usage("usage", $"Unknown asset subcommand '{args[0]}'.")
+        };
+    }
+
+    private static AssetCommandArgs ParseList(string[] args)
+    {
+        var json = false;
+        foreach (var token in args)
+        {
+            if (token == "--json")
+            {
+                json = true;
+                continue;
+            }
+
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs asset list [--json]");
+        }
+
+        return new AssetCommandArgs("list", null, null, json);
+    }
+
+    private static AssetCommandArgs ParseFileMutation(string action, string[] args)
+    {
+        string? name = null;
+        string? file = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            if (token is "--from" or "--file")
+            {
+                file = RequireValue(args, ref i, token);
+                continue;
+            }
+
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (name is not null)
+            {
+                throw CliException.Usage("usage", $"Usage: dotnet simpleagentchat.cs asset {action} <asset_name> --from <path>");
+            }
+
+            name = token;
+        }
+
+        if (name is null)
+        {
+            throw CliException.Usage("usage", $"asset {action} requires an asset name.");
+        }
+
+        if (file is null)
+        {
+            throw CliException.Usage("usage", $"asset {action} requires --from <path>.");
+        }
+
+        return new AssetCommandArgs(action, name, file, false);
+    }
+
+    private static AssetCommandArgs ParseRemove(string[] args)
+    {
+        string? name = null;
+        foreach (var token in args)
+        {
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (name is not null)
+            {
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs asset remove <asset_name>");
+            }
+
+            name = token;
+        }
+
+        if (name is null)
+        {
+            throw CliException.Usage("usage", "asset remove requires an asset name.");
+        }
+
+        return new AssetCommandArgs("remove", name, null, false);
+    }
+
+    private static string RequireValue(string[] args, ref int index, string option)
+    {
+        if (index + 1 >= args.Length)
+        {
+            throw CliException.Usage("usage", $"{option} requires a value.");
+        }
+
+        return args[++index];
     }
 }
 
@@ -1169,9 +1683,9 @@ internal sealed class ChatWorkspace
 
     private static string DefaultRoleInstructions(string role) => role switch
     {
-        "implementer" => "# Implementer Role\n\nImplement the goal cleanly and efficiently. Prefer pragmatic DRY and YAGNI. Fetch before meaningful work, read current goals and role memory, and wait for a human `Start` unless one already appears in fetched history.\n",
-        "reviewer" => "# Reviewer Role\n\nPerform a thorough code review. Look for gaps the implementer may have missed, flag serious concerns clearly, and if you are unsure why the implementation is done a certain way, ask a question in the chat. Fetch before meaningful review, read current goals and role memory, and mark goals done only after checking the implementation from this role's responsibility.\n",
-        _ => $"# {role} Role\n\nFollow `.simpleagentchat/HOW_TO_CHAT.md`. Read this file, role_memory.md, and current goals before participating.\n"
+        "implementer" => "# Implementer Role\n\nImplement the goal cleanly and efficiently. Prefer pragmatic DRY and YAGNI. Fetch before meaningful work, keep polling every 2-3 minutes while working, read current goals and role memory, and wait for a human `Start` unless one already appears in fetched history. Announce meaningful code, environment, or shared-state changes before or when you make them.\n",
+        "reviewer" => "# Reviewer Role\n\nPerform a thorough code review. Look for gaps the implementer may have missed, flag serious concerns clearly, and if you are unsure why the implementation is done a certain way, ask a question in the chat. Fetch before meaningful review, keep polling every 2-3 minutes while reviewing, read current goals and role memory, and mark goals done only after checking the implementation from this role's responsibility. Announce review findings or shared-state changes that may matter to others.\n",
+        _ => $"# {role} Role\n\nFollow `.simpleagentchat/HOW_TO_CHAT.md`. Read this file, role_memory.md, and current goals before participating. Keep polling every 2-3 minutes while working, and announce meaningful changes, findings, or questions that may matter to others.\n"
     };
 }
 
@@ -1282,10 +1796,10 @@ Before joining as an agent:
 
 During work:
 
-- Fetch from your latest fetched cursor before each meaningful step.
+- Fetch from your latest fetched cursor before each meaningful step and at least every 2-3 minutes while you are doing actual work.
 - Keep a long-poll fetch active or repeat long waits from your latest fetched cursor until a fetched message explicitly tells you not to listen. A `timedOut: true` response means no message arrived during that wait, not that you may stop listening. Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from `fetch`.
-- To improve collaboration, inform the chat when you complete a large or important chunk of work, even if the whole goal is not done yet. Keep these progress updates concise and avoid spamming routine activity.
+- To improve collaboration, inform the chat when you complete a large or important chunk of work, find anything of interest, are about to make a big change, or want the opinion of other participants. Keep these updates concise and avoid spamming routine activity.
 - Obey critical messages that start with `!` immediately.
 - Obey newly fetched `system` messages immediately.
 - Re-read role instructions, role memory, and goals when instructed.
@@ -1568,11 +2082,383 @@ internal static class GoalSystemMessages
         $"Goal `{goalName}` changed. All current roles were marked undone and must re-read `.simpleagentchat/goals/{goalName}`, reprocess the goal, and re-approve it with `goal done` after checking their role's responsibility.";
 }
 
+internal static class AssetLimits
+{
+    public const long MaxBytes = 25L * 1024L * 1024L;
+}
+
+internal sealed record RoleListItem(string Role, long InstructionsLength, long MemoryLength, string? UpdatedAtUtc);
+internal sealed record GoalListItem(string Name, long Length, string? UpdatedAtUtc, bool Complete, GoalStatusReport Status);
+internal sealed record AssetListItem(string Name, long Length, string? UpdatedAtUtc);
+
+internal static class ResourceOperations
+{
+    public static IReadOnlyList<RoleListItem> ListRoles(ChatWorkspace workspace) =>
+        workspace.GetRoleNames()
+            .Select(role =>
+            {
+                var dir = workspace.RoleDirectory(role);
+                var instructions = new FileInfo(Path.Combine(dir, "instructions.md"));
+                var memory = new FileInfo(Path.Combine(dir, "role_memory.md"));
+                return new RoleListItem(
+                    role,
+                    instructions.Exists ? instructions.Length : 0,
+                    memory.Exists ? memory.Length : 0,
+                    LatestWriteUtc(instructions, memory));
+            })
+            .ToArray();
+
+    public static async Task<IReadOnlyList<Message>> AddRoleAsync(ChatWorkspace workspace, RoleCommandArgs args)
+    {
+        var role = args.Role!;
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = workspace.RoleDirectory(role);
+        if (Directory.Exists(dir))
+        {
+            throw CliException.Validation("role_exists", $"Role '{role}' already exists.");
+        }
+
+        var instructions = args.InstructionsFile is null ? null : ReadTextFile(args.InstructionsFile, "--instructions");
+        var memory = args.MemoryFile is null ? null : ReadTextFile(args.MemoryFile, "--memory");
+        workspace.EnsureRoleFiles(role);
+        var instructionsPath = Path.Combine(dir, "instructions.md");
+        var memoryPath = Path.Combine(dir, "role_memory.md");
+        if (instructions is not null)
+        {
+            Atomic.WriteText(instructionsPath, instructions);
+        }
+
+        if (memory is not null)
+        {
+            Atomic.WriteText(memoryPath, memory);
+        }
+
+        var message = await new MessageStore(workspace).AppendAsync(
+            "system",
+            "roles.changed",
+            "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
+            new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, memoryPath), RootRelative(workspace, workspace.RoleSourcePath(role)) },
+            args.WaitMs);
+        return new[] { message };
+    }
+
+    public static async Task<IReadOnlyList<Message>> UpdateRoleAsync(ChatWorkspace workspace, RoleCommandArgs args)
+    {
+        var role = args.Role!;
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = workspace.RoleDirectory(role);
+        if (!Directory.Exists(dir))
+        {
+            throw CliException.Validation("missing_role", $"Role '{role}' does not exist.");
+        }
+
+        var instructions = args.InstructionsFile is null ? null : ReadTextFile(args.InstructionsFile, "--instructions");
+        var memory = args.MemoryFile is null ? null : ReadTextFile(args.MemoryFile, "--memory");
+        if (instructions is null && memory is null)
+        {
+            throw CliException.Usage("usage", "role update requires --instructions and/or --memory.");
+        }
+
+        workspace.EnsureRoleFiles(role);
+        var messages = new List<Message>();
+        var store = new MessageStore(workspace);
+
+        if (instructions is not null)
+        {
+            var instructionsPath = Path.Combine(dir, "instructions.md");
+            Atomic.WriteText(instructionsPath, instructions);
+            messages.Add(await store.AppendAsync(
+                "system",
+                "roles.changed",
+                "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
+                new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, workspace.RoleSourcePath(role)) },
+                args.WaitMs));
+        }
+
+        if (memory is not null)
+        {
+            var memoryPath = Path.Combine(dir, "role_memory.md");
+            Atomic.WriteText(memoryPath, memory);
+            messages.Add(await store.AppendAsync(
+                "system",
+                "roles.memory.changed",
+                "Role memory changed. Agents using that role must re-read role memory before continuing.",
+                new[] { RootRelative(workspace, memoryPath) },
+                args.WaitMs));
+        }
+
+        return messages;
+    }
+
+    public static async Task<Message> RemoveRoleAsync(ChatWorkspace workspace, string role, int waitMs)
+    {
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role name is not safe.");
+        }
+
+        var dir = workspace.RoleDirectory(role);
+        if (!Directory.Exists(dir))
+        {
+            throw CliException.Validation("missing_role", $"Role '{role}' does not exist.");
+        }
+
+        Directory.Delete(dir, recursive: true);
+        return await new MessageStore(workspace).AppendAsync(
+            "system",
+            "roles.deleted",
+            $"! Role \"{role}\" was deleted. Any agent using that role must stop immediately.",
+            new[] { RootRelative(workspace, dir) },
+            waitMs);
+    }
+
+    public static IReadOnlyList<GoalListItem> ListGoals(ChatWorkspace workspace)
+    {
+        var statusStore = new GoalStatusStore(workspace);
+        return workspace.GetGoalNames()
+            .Select(name =>
+            {
+                var file = new FileInfo(workspace.GoalPath(name));
+                var status = statusStore.GetStatus(name);
+                return new GoalListItem(
+                    name,
+                    file.Exists ? file.Length : 0,
+                    file.Exists ? Time.RoundTrip(file.LastWriteTimeUtc) : null,
+                    status.Complete,
+                    status);
+            })
+            .ToArray();
+    }
+
+    public static async Task<Message> AddGoalAsync(ChatWorkspace workspace, string name, string filePath, int waitMs)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        var goalPath = workspace.GoalPath(name);
+        if (File.Exists(goalPath))
+        {
+            throw CliException.Validation("goal_exists", $"Goal '{name}' already exists.");
+        }
+
+        var content = ReadTextFile(filePath, "--from");
+        Atomic.WriteText(goalPath, content);
+        var message = MessageStore.NewMessage(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, workspace.GoalStatusPath(name)) });
+        new GoalStatusStore(workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
+        await new MessageStore(workspace).AppendPreparedBatchAsync(new[] { message }, waitMs);
+        return message;
+    }
+
+    public static async Task<Message> UpdateGoalAsync(ChatWorkspace workspace, string name, string filePath, int waitMs)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        var goalPath = workspace.GoalPath(name);
+        if (!File.Exists(goalPath))
+        {
+            throw CliException.Validation("missing_goal", $"Goal '{name}' does not exist.");
+        }
+
+        var content = ReadTextFile(filePath, "--from");
+        var statusPath = workspace.GoalStatusPath(name);
+        var store = new MessageStore(workspace);
+        var message = MessageStore.NewMessage(
+            "system",
+            "goals.changed",
+            GoalSystemMessages.Edited(name),
+            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, statusPath) });
+
+        await Retry.WithinAsync(waitMs, async () =>
+        {
+            Atomic.WriteText(goalPath, content);
+            new GoalStatusStore(workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
+            await store.WriteMessageFileNoRetryAsync(message);
+        });
+
+        return message;
+    }
+
+    public static async Task<Message> RemoveGoalAsync(ChatWorkspace workspace, string name, int waitMs)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        var goalPath = workspace.GoalPath(name);
+        if (!File.Exists(goalPath))
+        {
+            throw CliException.Validation("missing_goal", $"Goal '{name}' does not exist.");
+        }
+
+        var statusPath = workspace.GoalStatusPath(name);
+        File.Delete(goalPath);
+        if (File.Exists(statusPath))
+        {
+            File.Delete(statusPath);
+        }
+
+        return await new MessageStore(workspace).AppendAsync(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, statusPath) },
+            waitMs);
+    }
+
+    public static IReadOnlyList<AssetListItem> ListAssets(ChatWorkspace workspace) =>
+        workspace.GetAssetNames()
+            .Select(name =>
+            {
+                var file = new FileInfo(workspace.AssetPath(name));
+                return new AssetListItem(
+                    name,
+                    file.Exists ? file.Length : 0,
+                    file.Exists ? Time.RoundTrip(file.LastWriteTimeUtc) : null);
+            })
+            .ToArray();
+
+    public static void AddAsset(ChatWorkspace workspace, string name, string filePath)
+    {
+        var path = ValidateAssetTarget(workspace, name);
+        if (File.Exists(path))
+        {
+            throw CliException.Validation("asset_exists", $"Asset '{name}' already exists.");
+        }
+
+        CopyAssetFile(workspace, path, filePath, overwrite: false);
+    }
+
+    public static void UpdateAsset(ChatWorkspace workspace, string name, string filePath)
+    {
+        var path = ValidateAssetTarget(workspace, name);
+        if (!File.Exists(path))
+        {
+            throw CliException.Validation("missing_asset", $"Asset '{name}' does not exist.");
+        }
+
+        CopyAssetFile(workspace, path, filePath, overwrite: true);
+    }
+
+    public static void RemoveAsset(ChatWorkspace workspace, string name)
+    {
+        var path = ValidateAssetTarget(workspace, name);
+        if (!File.Exists(path))
+        {
+            throw CliException.Validation("missing_asset", $"Asset '{name}' does not exist.");
+        }
+
+        File.Delete(path);
+    }
+
+    private static string ValidateAssetTarget(ChatWorkspace workspace, string name)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
+        }
+
+        return workspace.AssetPath(name);
+    }
+
+    private static void CopyAssetFile(ChatWorkspace workspace, string targetPath, string sourcePath, bool overwrite)
+    {
+        var source = ValidateReadableFile(sourcePath, "--from");
+        if (source.Length > AssetLimits.MaxBytes)
+        {
+            throw CliException.Validation("asset_too_large", "Asset upload exceeds the 25 MiB limit.");
+        }
+
+        Directory.CreateDirectory(workspace.AssetsDir);
+        var tempPath = Path.Combine(workspace.AssetsDir, "." + Path.GetFileName(targetPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            File.Copy(source.FullName, tempPath, overwrite: false);
+            File.Move(tempPath, targetPath, overwrite);
+        }
+        catch
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+
+            throw;
+        }
+    }
+
+    private static string ReadTextFile(string path, string option)
+    {
+        ValidateReadableFile(path, option);
+        try
+        {
+            return File.ReadAllText(path, Encoding.UTF8);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            throw CliException.Validation("unreadable_file", $"Could not read {option} path: {ex.Message}");
+        }
+    }
+
+    private static FileInfo ValidateReadableFile(string path, string option)
+    {
+        FileInfo file;
+        try
+        {
+            file = new FileInfo(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            throw CliException.Validation("unreadable_file", $"Could not read {option} path: {ex.Message}");
+        }
+
+        if (!file.Exists)
+        {
+            throw CliException.Validation("unreadable_file", $"{option} path does not exist.");
+        }
+
+        if ((file.Attributes & FileAttributes.Directory) == FileAttributes.Directory)
+        {
+            throw CliException.Validation("unreadable_file", $"{option} path is a directory.");
+        }
+
+        return file;
+    }
+
+    private static string? LatestWriteUtc(params FileInfo[] files)
+    {
+        var latest = files.Where(file => file.Exists)
+            .Select(file => (DateTimeOffset?)file.LastWriteTimeUtc)
+            .OrderByDescending(value => value)
+            .FirstOrDefault();
+        return latest.HasValue ? Time.RoundTrip(latest.Value) : null;
+    }
+
+    private static string RootRelative(ChatWorkspace workspace, string fullPath) =>
+        Path.GetRelativePath(workspace.Root, fullPath).Replace('\\', '/');
+}
+
 internal sealed class LocalServer
 {
     private const int DefaultStartPort = 8765;
     private const int DefaultEndPort = 8799;
-    private const long MaxAssetBytes = 25L * 1024L * 1024L;
     private readonly ChatWorkspace _workspace;
     private readonly int? _requestedPort;
     private readonly bool _noOpen;
@@ -2434,7 +3320,7 @@ internal sealed class LocalServer
             throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
         }
 
-        if (context.Request.ContentLength64 > MaxAssetBytes)
+        if (context.Request.ContentLength64 > AssetLimits.MaxBytes)
         {
             throw new ApiException(413, "asset_too_large", "Asset upload exceeds the 25 MiB limit.");
         }
@@ -2458,7 +3344,7 @@ internal sealed class LocalServer
                     }
 
                     total += read;
-                    if (total > MaxAssetBytes)
+                    if (total > AssetLimits.MaxBytes)
                     {
                         throw new ApiException(413, "asset_too_large", "Asset upload exceeds the 25 MiB limit.");
                     }
@@ -3003,8 +3889,9 @@ internal static class RolePrompts
             $"Then join as `{role}`:",
             $"- If your current participation is not already clear from the fetched chat, announce yourself briefly with `{runnerCommand} say {role} \"...\"`.",
             "- Start the simpleagentchat protocol: do the role's work, and keep polling/fetching for other messages in the meantime.",
-            "- Track the latest `nextCursor`. Before each meaningful work step, fetch from it and obey human, system, and relevant role messages.",
+            "- Track the latest `nextCursor`. Before each meaningful work step, and at least every 2-3 minutes while doing actual work, fetch from it and obey human, system, and relevant role messages.",
             $"- If no messages are available, long-poll with `{runnerCommand} fetch <nextCursor> --wait-ms {FetchArgs.DefaultWaitMs} --json`. If a long poll returns no messages or times out, continue polling.",
+            "- Announce when you complete a large or important piece of work, find anything of interest, are about to make a big change, or want the opinion of other participants.",
             "- Do not stop just because current goals are done; keep listening until a human or system message explicitly tells your role to stop.",
             $"- When your role finishes its part, post a concise handoff/conclusion. Use `{runnerCommand} goal done {role} <goal_file_name>` only after checking the goal from your role's responsibility."
         }) + "\n";
