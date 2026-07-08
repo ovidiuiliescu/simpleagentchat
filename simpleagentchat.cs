@@ -13,6 +13,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Security.Cryptography;
@@ -33,7 +34,7 @@ internal static class Program
         {
             if (args.Length == 0)
             {
-                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|role|goal|asset|export-html> ...");
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|role|goal|asset|archive|export-html> ...");
             }
 
             ErrorWriter.JsonMode = WantsJsonErrors(args);
@@ -47,6 +48,7 @@ internal static class Program
                 "role" => await Commands.RoleAsync(rest),
                 "goal" => await Commands.GoalAsync(rest),
                 "asset" => await Commands.AssetAsync(rest),
+                "archive" => await Commands.ArchiveAsync(rest),
                 "serve" => await Commands.ServeAsync(rest),
                 "export-html" => await Commands.ExportHtmlAsync(rest),
                 _ => throw CliException.Usage("unknown_command", $"Unknown command '{command}'.")
@@ -67,7 +69,7 @@ internal static class Program
     private static bool WantsJsonErrors(string[] args)
     {
         return args.Length > 1 &&
-               (args[0] == "fetch" || args[0] == "role" || args[0] == "goal" || args[0] == "asset") &&
+               (args[0] == "fetch" || args[0] == "role" || args[0] == "goal" || args[0] == "asset" || args[0] == "archive") &&
                args.Skip(1).Any(arg => arg == "--json");
     }
 }
@@ -319,6 +321,47 @@ internal static class Commands
             default:
                 throw CliException.Usage("usage", "Unknown asset subcommand.");
         }
+    }
+
+    public static Task<int> ArchiveAsync(string[] args)
+    {
+        var parsed = ArchiveCommandArgs.Parse(args);
+        ErrorWriter.JsonMode = parsed.Json;
+        var root = RepositoryRoot.FindRequired();
+
+        if (parsed.Action == "export")
+        {
+            var workspace = ChatWorkspace.OpenExisting(root);
+            var result = ArchiveOperations.ExportToFile(workspace, parsed.FilePath, parsed.Scope);
+            if (parsed.Json)
+            {
+                Console.Out.WriteLine(Json.Text(result));
+            }
+            else
+            {
+                PlainText.WriteArchiveResult(result);
+            }
+
+            return Task.FromResult(0);
+        }
+
+        if (parsed.Action == "import")
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            var result = ArchiveOperations.ImportFromFile(workspace, parsed.FilePath, parsed.ImportMode!.Value, parsed.Scope);
+            if (parsed.Json)
+            {
+                Console.Out.WriteLine(Json.Text(result));
+            }
+            else
+            {
+                PlainText.WriteArchiveResult(result);
+            }
+
+            return Task.FromResult(0);
+        }
+
+        throw CliException.Usage("usage", "Unknown archive subcommand.");
     }
 
     public static async Task<int> ServeAsync(string[] args)
@@ -1088,6 +1131,193 @@ internal sealed record AssetCommandArgs(string Action, string? Name, string? Fil
 
         return args[++index];
     }
+}
+
+internal enum ArchiveImportMode
+{
+    Merge,
+    Replace
+}
+
+internal sealed record ArchiveScope(bool Roles, bool Goals, bool GoalStatus, bool Messages, bool Assets)
+{
+    public static ArchiveScope All { get; } = new(true, true, true, true, true);
+
+    public bool Any => Roles || Goals || GoalStatus || Messages || Assets;
+
+    public string[] Names
+    {
+        get
+        {
+            var names = new List<string>();
+            if (Roles) names.Add("roles");
+            if (Goals) names.Add("goals");
+            if (GoalStatus) names.Add("goal_status");
+            if (Messages) names.Add("messages");
+            if (Assets) names.Add("assets");
+            return names.ToArray();
+        }
+    }
+}
+
+internal sealed record ArchiveCommandArgs(string Action, string FilePath, ArchiveScope Scope, ArchiveImportMode? ImportMode, bool Json)
+{
+    public static ArchiveCommandArgs Parse(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs archive <export|import> ...");
+        }
+
+        var action = args[0];
+        return action switch
+        {
+            "export" => ParseExport(args.Skip(1).ToArray()),
+            "import" => ParseImport(args.Skip(1).ToArray()),
+            _ => throw CliException.Usage("usage", $"Unknown archive subcommand '{action}'.")
+        };
+    }
+
+    private static ArchiveCommandArgs ParseExport(string[] args)
+    {
+        var parsed = ParseCommon(args, allowMode: false);
+        if (parsed.Mode is not null)
+        {
+            throw CliException.Usage("usage", "archive export does not accept import mode options.");
+        }
+
+        return new ArchiveCommandArgs("export", parsed.FilePath, parsed.Scope, null, parsed.Json);
+    }
+
+    private static ArchiveCommandArgs ParseImport(string[] args)
+    {
+        var parsed = ParseCommon(args, allowMode: true);
+        if (parsed.Mode is null)
+        {
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs archive import <zip_path> (--merge|--replace) [--roles] [--goals] [--goal-status] [--messages] [--assets] [--json]");
+        }
+
+        return new ArchiveCommandArgs("import", parsed.FilePath, parsed.Scope, parsed.Mode, parsed.Json);
+    }
+
+    private static ParsedArchiveOptions ParseCommon(string[] args, bool allowMode)
+    {
+        string? filePath = null;
+        var scope = new ArchiveScope(false, false, false, false, false);
+        var sawScope = false;
+        ArchiveImportMode? mode = null;
+        var json = false;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var token = args[i];
+            switch (token)
+            {
+                case "--json":
+                    json = true;
+                    continue;
+                case "--all":
+                    scope = ArchiveScope.All;
+                    sawScope = true;
+                    continue;
+                case "--roles":
+                    scope = scope with { Roles = true };
+                    sawScope = true;
+                    continue;
+                case "--goals":
+                    scope = scope with { Goals = true };
+                    sawScope = true;
+                    continue;
+                case "--goal-status":
+                case "--goal-statuses":
+                case "--statuses":
+                    scope = scope with { GoalStatus = true };
+                    sawScope = true;
+                    continue;
+                case "--messages":
+                    scope = scope with { Messages = true };
+                    sawScope = true;
+                    continue;
+                case "--assets":
+                    scope = scope with { Assets = true };
+                    sawScope = true;
+                    continue;
+                case "--merge":
+                    if (!allowMode)
+                    {
+                        throw CliException.Usage("usage", "archive export does not accept --merge.");
+                    }
+
+                    mode = SetImportMode(mode, ArchiveImportMode.Merge);
+                    continue;
+                case "--replace":
+                    if (!allowMode)
+                    {
+                        throw CliException.Usage("usage", "archive export does not accept --replace.");
+                    }
+
+                    mode = SetImportMode(mode, ArchiveImportMode.Replace);
+                    continue;
+                case "--mode":
+                    if (!allowMode)
+                    {
+                        throw CliException.Usage("usage", "archive export does not accept --mode.");
+                    }
+
+                    if (i + 1 >= args.Length)
+                    {
+                        throw CliException.Usage("usage", "--mode requires merge or replace.");
+                    }
+
+                    mode = SetImportMode(mode, ParseImportMode(args[++i]));
+                    continue;
+            }
+
+            if (token.StartsWith('-'))
+            {
+                throw CliException.Usage("usage", $"Unknown option '{token}'.");
+            }
+
+            if (filePath is not null)
+            {
+                throw CliException.Usage("usage", "Archive commands accept exactly one zip path.");
+            }
+
+            filePath = token;
+        }
+
+        if (filePath is null)
+        {
+            throw CliException.Usage("usage", "Archive commands require a zip path.");
+        }
+
+        var finalScope = sawScope ? scope : ArchiveScope.All;
+        if (!finalScope.Any)
+        {
+            throw CliException.Usage("usage", "At least one archive content type must be selected.");
+        }
+
+        return new ParsedArchiveOptions(filePath, finalScope, mode, json);
+    }
+
+    private static ArchiveImportMode SetImportMode(ArchiveImportMode? current, ArchiveImportMode next)
+    {
+        if (current is not null && current.Value != next)
+        {
+            throw CliException.Usage("usage", "Choose only one import mode: --merge or --replace.");
+        }
+
+        return next;
+    }
+
+    private static ArchiveImportMode ParseImportMode(string value) => value switch
+    {
+        "merge" => ArchiveImportMode.Merge,
+        "replace" => ArchiveImportMode.Replace,
+        _ => throw CliException.Usage("usage", "--mode requires merge or replace.")
+    };
+
+    private sealed record ParsedArchiveOptions(string FilePath, ArchiveScope Scope, ArchiveImportMode? Mode, bool Json);
 }
 
 internal sealed record ServeArgs(int? Port, bool NoOpen)
@@ -2091,6 +2321,31 @@ internal sealed record RoleListItem(string Role, long InstructionsLength, long M
 internal sealed record RoleSaveResult(bool Created, Message Message);
 internal sealed record GoalListItem(string Name, long Length, string? UpdatedAtUtc, bool Complete, GoalStatusReport Status);
 internal sealed record AssetListItem(string Name, long Length, string? UpdatedAtUtc);
+internal sealed record ArchiveCounts(int Roles, int Goals, int GoalStatus, int Messages, int Assets)
+{
+    public int Total => Roles + Goals + GoalStatus + Messages + Assets;
+
+    public ArchiveCounts Add(ArchiveGroup group) => group switch
+    {
+        ArchiveGroup.Roles => this with { Roles = Roles + 1 },
+        ArchiveGroup.Goals => this with { Goals = Goals + 1 },
+        ArchiveGroup.GoalStatus => this with { GoalStatus = GoalStatus + 1 },
+        ArchiveGroup.Messages => this with { Messages = Messages + 1 },
+        ArchiveGroup.Assets => this with { Assets = Assets + 1 },
+        _ => this
+    };
+}
+
+internal sealed record ArchiveOperationResult(string Operation, string? Path, string? Mode, ArchiveScope Scope, ArchiveCounts Counts);
+
+internal enum ArchiveGroup
+{
+    Roles,
+    Goals,
+    GoalStatus,
+    Messages,
+    Assets
+}
 
 internal static class ResourceOperations
 {
@@ -2492,6 +2747,376 @@ internal static class ResourceOperations
         Path.GetRelativePath(workspace.Root, fullPath).Replace('\\', '/');
 }
 
+internal static class ArchiveOperations
+{
+    private const string ManifestName = "simpleagentchat-archive.json";
+    private const string GoalStatusSuffix = ".status.json";
+
+    public static ArchiveOperationResult ExportToFile(ChatWorkspace workspace, string zipPath, ArchiveScope scope)
+    {
+        var finalPath = Path.GetFullPath(zipPath);
+        var directory = Path.GetDirectoryName(finalPath);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            throw CliException.Validation("invalid_archive_path", "Archive path must have a parent directory.");
+        }
+
+        Directory.CreateDirectory(directory);
+        var tempPath = Path.Combine(directory, "." + Path.GetFileName(finalPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+            {
+                ExportToStream(workspace, stream, scope);
+            }
+
+            File.Move(tempPath, finalPath, overwrite: true);
+            return ExportResult(finalPath, scope, CountExportableFiles(workspace, scope));
+        }
+        catch
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+
+            throw;
+        }
+    }
+
+    public static ArchiveOperationResult ExportToStream(ChatWorkspace workspace, Stream output, ArchiveScope scope)
+    {
+        if (!scope.Any)
+        {
+            throw CliException.Usage("usage", "At least one archive content type must be selected.");
+        }
+
+        var counts = new ArchiveCounts(0, 0, 0, 0, 0);
+        using var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true);
+        WriteManifest(archive, scope);
+
+        if (scope.Roles)
+        {
+            foreach (var role in workspace.GetRoleNames())
+            {
+                var dir = workspace.RoleDirectory(role);
+                counts = AddFile(archive, $"roles/{role}/instructions.md", Path.Combine(dir, "instructions.md"), ArchiveGroup.Roles, counts);
+                counts = AddFile(archive, $"roles/{role}/role_memory.md", Path.Combine(dir, "role_memory.md"), ArchiveGroup.Roles, counts);
+            }
+        }
+
+        if (scope.Goals)
+        {
+            foreach (var name in workspace.GetGoalNames())
+            {
+                counts = AddFile(archive, $"goals/{name}", workspace.GoalPath(name), ArchiveGroup.Goals, counts);
+            }
+        }
+
+        if (scope.GoalStatus && Directory.Exists(workspace.GoalStatusDir))
+        {
+            foreach (var file in Directory.EnumerateFiles(workspace.GoalStatusDir, "*" + GoalStatusSuffix).Order(StringComparer.Ordinal))
+            {
+                var fileName = Path.GetFileName(file);
+                var goalName = fileName[..^GoalStatusSuffix.Length];
+                if (NameRules.IsValidGoalOrAssetName(goalName))
+                {
+                    counts = AddFile(archive, $"goal_status/{fileName}", file, ArchiveGroup.GoalStatus, counts);
+                }
+            }
+        }
+
+        if (scope.Messages && Directory.Exists(workspace.MessagesDir))
+        {
+            foreach (var file in Directory.EnumerateFiles(workspace.MessagesDir, "*.json").Order(StringComparer.Ordinal))
+            {
+                var id = Path.GetFileNameWithoutExtension(file);
+                if (NameRules.IsValidMessageId(id))
+                {
+                    counts = AddFile(archive, $"messages/{id}.json", file, ArchiveGroup.Messages, counts);
+                }
+            }
+        }
+
+        if (scope.Assets)
+        {
+            foreach (var name in workspace.GetAssetNames())
+            {
+                counts = AddFile(archive, $"assets/{name}", workspace.AssetPath(name), ArchiveGroup.Assets, counts);
+            }
+        }
+
+        return ExportResult(null, scope, counts);
+    }
+
+    public static ArchiveOperationResult ImportFromFile(ChatWorkspace workspace, string zipPath, ArchiveImportMode mode, ArchiveScope scope)
+    {
+        if (!scope.Any)
+        {
+            throw CliException.Usage("usage", "At least one archive content type must be selected.");
+        }
+
+        var sourcePath = Path.GetFullPath(zipPath);
+        if (!File.Exists(sourcePath))
+        {
+            throw CliException.Validation("unreadable_file", "Archive zip path does not exist.");
+        }
+
+        try
+        {
+            using var archive = ZipFile.OpenRead(sourcePath);
+            var counts = ImportFromArchive(workspace, archive, mode, scope);
+            return new ArchiveOperationResult("import", sourcePath, ModeName(mode), scope, counts);
+        }
+        catch (InvalidDataException ex)
+        {
+            throw CliException.Validation("invalid_archive", $"Archive zip is invalid: {ex.Message}");
+        }
+    }
+
+    private static ArchiveCounts ImportFromArchive(ChatWorkspace workspace, ZipArchive archive, ArchiveImportMode mode, ArchiveScope scope)
+    {
+        if (mode == ArchiveImportMode.Replace)
+        {
+            ClearSelectedContent(workspace, scope);
+        }
+
+        var counts = new ArchiveCounts(0, 0, 0, 0, 0);
+        foreach (var entry in archive.Entries.OrderBy(entry => entry.FullName, StringComparer.Ordinal))
+        {
+            var target = MapImportTarget(workspace, entry, scope);
+            if (target is null)
+            {
+                continue;
+            }
+
+            ExtractEntry(entry, target.TargetPath, target.Group);
+            counts = counts.Add(target.Group);
+        }
+
+        if (scope.Roles)
+        {
+            foreach (var role in workspace.GetRoleNames())
+            {
+                workspace.EnsureRoleFiles(role);
+            }
+        }
+
+        HtmlViews.WriteUiShell(workspace);
+        return counts;
+    }
+
+    private static void ClearSelectedContent(ChatWorkspace workspace, ArchiveScope scope)
+    {
+        if (scope.Roles) ClearDirectoryContents(workspace.RolesDir);
+        if (scope.Goals) ClearDirectoryContents(workspace.GoalsDir);
+        if (scope.GoalStatus) ClearDirectoryContents(workspace.GoalStatusDir);
+        if (scope.Messages) ClearDirectoryContents(workspace.MessagesDir);
+        if (scope.Assets) ClearDirectoryContents(workspace.AssetsDir);
+    }
+
+    private static void ClearDirectoryContents(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        foreach (var file in Directory.EnumerateFiles(directory))
+        {
+            File.Delete(file);
+        }
+
+        foreach (var child in Directory.EnumerateDirectories(directory))
+        {
+            Directory.Delete(child, recursive: true);
+        }
+    }
+
+    private static ArchiveImportTarget? MapImportTarget(ChatWorkspace workspace, ZipArchiveEntry entry, ArchiveScope scope)
+    {
+        var name = NormalizeEntryName(entry.FullName);
+        if (name is null || name == ManifestName)
+        {
+            return null;
+        }
+
+        var parts = name.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+        {
+            return null;
+        }
+
+        if (parts[0] == "roles" && scope.Roles && parts.Length == 3)
+        {
+            var role = parts[1];
+            var fileName = parts[2];
+            if (NameRules.IsValidRoleName(role, allowReserved: false) &&
+                fileName is "instructions.md" or "role_memory.md")
+            {
+                return new ArchiveImportTarget(ArchiveGroup.Roles, Path.Combine(workspace.RoleDirectory(role), fileName));
+            }
+        }
+
+        if (parts[0] == "goals" && scope.Goals && parts.Length == 2 && NameRules.IsValidGoalOrAssetName(parts[1]))
+        {
+            return new ArchiveImportTarget(ArchiveGroup.Goals, workspace.GoalPath(parts[1]));
+        }
+
+        if (parts[0] == "goal_status" && scope.GoalStatus && parts.Length == 2 && parts[1].EndsWith(GoalStatusSuffix, StringComparison.Ordinal))
+        {
+            var goalName = parts[1][..^GoalStatusSuffix.Length];
+            if (NameRules.IsValidGoalOrAssetName(goalName))
+            {
+                return new ArchiveImportTarget(ArchiveGroup.GoalStatus, ChatWorkspace.SafeCombine(workspace.GoalStatusDir, parts[1]));
+            }
+        }
+
+        if (parts[0] == "messages" && scope.Messages && parts.Length == 2 && parts[1].EndsWith(".json", StringComparison.Ordinal))
+        {
+            var id = parts[1][..^".json".Length];
+            if (NameRules.IsValidMessageId(id))
+            {
+                return new ArchiveImportTarget(ArchiveGroup.Messages, ChatWorkspace.SafeCombine(workspace.MessagesDir, parts[1]));
+            }
+        }
+
+        if (parts[0] == "assets" && scope.Assets && parts.Length == 2 && NameRules.IsValidGoalOrAssetName(parts[1]))
+        {
+            return new ArchiveImportTarget(ArchiveGroup.Assets, workspace.AssetPath(parts[1]));
+        }
+
+        return null;
+    }
+
+    private static string? NormalizeEntryName(string entryName)
+    {
+        var name = entryName.Replace('\\', '/').TrimStart('/');
+        while (name.StartsWith("./", StringComparison.Ordinal))
+        {
+            name = name[2..];
+        }
+
+        if (name.EndsWith("/", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        if (name.StartsWith(".simpleagentchat/", StringComparison.Ordinal))
+        {
+            name = name[".simpleagentchat/".Length..];
+        }
+
+        return name;
+    }
+
+    private static void ExtractEntry(ZipArchiveEntry entry, string targetPath, ArchiveGroup group)
+    {
+        if (group == ArchiveGroup.Assets && entry.Length > AssetLimits.MaxBytes)
+        {
+            throw CliException.Validation("asset_too_large", "Imported asset exceeds the 25 MiB limit.");
+        }
+
+        var directory = Path.GetDirectoryName(targetPath)!;
+        Directory.CreateDirectory(directory);
+        var tempPath = Path.Combine(directory, "." + Path.GetFileName(targetPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            using (var input = entry.Open())
+            using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                input.CopyTo(output);
+                output.Flush(flushToDisk: true);
+            }
+
+            File.Move(tempPath, targetPath, overwrite: true);
+        }
+        catch
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+
+            throw;
+        }
+    }
+
+    private static void WriteManifest(ZipArchive archive, ArchiveScope scope)
+    {
+        var entry = archive.CreateEntry(ManifestName, CompressionLevel.Optimal);
+        using var writer = new StreamWriter(entry.Open(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        writer.Write(Json.Text(new
+        {
+            schemaVersion = 1,
+            createdAtUtc = Time.UtcNowRoundTrip(),
+            scope = scope.Names
+        }));
+        writer.Write('\n');
+    }
+
+    private static ArchiveCounts AddFile(ZipArchive archive, string entryName, string path, ArchiveGroup group, ArchiveCounts counts)
+    {
+        if (!File.Exists(path))
+        {
+            return counts;
+        }
+
+        var entry = archive.CreateEntry(entryName, CompressionLevel.Optimal);
+        entry.LastWriteTime = new DateTimeOffset(File.GetLastWriteTimeUtc(path));
+        using var input = File.OpenRead(path);
+        using var output = entry.Open();
+        input.CopyTo(output);
+        return counts.Add(group);
+    }
+
+    private static ArchiveCounts CountExportableFiles(ChatWorkspace workspace, ArchiveScope scope)
+    {
+        var counts = new ArchiveCounts(0, 0, 0, 0, 0);
+        if (scope.Roles)
+        {
+            foreach (var role in workspace.GetRoleNames())
+            {
+                var dir = workspace.RoleDirectory(role);
+                if (File.Exists(Path.Combine(dir, "instructions.md"))) counts = counts.Add(ArchiveGroup.Roles);
+                if (File.Exists(Path.Combine(dir, "role_memory.md"))) counts = counts.Add(ArchiveGroup.Roles);
+            }
+        }
+
+        if (scope.Goals)
+        {
+            foreach (var _ in workspace.GetGoalNames()) counts = counts.Add(ArchiveGroup.Goals);
+        }
+
+        if (scope.GoalStatus && Directory.Exists(workspace.GoalStatusDir))
+        {
+            foreach (var file in Directory.EnumerateFiles(workspace.GoalStatusDir, "*" + GoalStatusSuffix))
+            {
+                var name = Path.GetFileName(file);
+                if (NameRules.IsValidGoalOrAssetName(name[..^GoalStatusSuffix.Length])) counts = counts.Add(ArchiveGroup.GoalStatus);
+            }
+        }
+
+        if (scope.Messages && Directory.Exists(workspace.MessagesDir))
+        {
+            foreach (var file in Directory.EnumerateFiles(workspace.MessagesDir, "*.json"))
+            {
+                if (NameRules.IsValidMessageId(Path.GetFileNameWithoutExtension(file))) counts = counts.Add(ArchiveGroup.Messages);
+            }
+        }
+
+        if (scope.Assets)
+        {
+            foreach (var _ in workspace.GetAssetNames()) counts = counts.Add(ArchiveGroup.Assets);
+        }
+
+        return counts;
+    }
+
+    private static ArchiveOperationResult ExportResult(string? path, ArchiveScope scope, ArchiveCounts counts) =>
+        new("export", path, null, scope, counts);
+
+    private static string ModeName(ArchiveImportMode mode) => mode == ArchiveImportMode.Replace ? "replace" : "merge";
+
+    private sealed record ArchiveImportTarget(ArchiveGroup Group, string TargetPath);
+}
+
 internal sealed class LocalServer
 {
     private const int DefaultStartPort = 8765;
@@ -2736,6 +3361,12 @@ internal sealed class LocalServer
             return;
         }
 
+        if (segments.Length >= 2 && segments[1] == "archive")
+        {
+            await RouteArchiveApiAsync(context, method, segments);
+            return;
+        }
+
         if (segments.Length >= 2 && segments[1] == "roles")
         {
             await RouteRolesAsync(context, method, segments);
@@ -2970,6 +3601,67 @@ internal sealed class LocalServer
     {
         HtmlViews.RegenerateChat(_workspace);
         await WriteJsonAsync(context, 200, new { path = _workspace.ChatHtmlPath, url = "/chat.html" });
+    }
+
+    private async Task RouteArchiveApiAsync(HttpListenerContext context, string method, string[] segments)
+    {
+        if (segments.Length == 3 && segments[2] == "export" && method == "GET")
+        {
+            await ExportArchiveAsync(context);
+            return;
+        }
+
+        if (segments.Length == 3 && segments[2] == "import" && method == "POST")
+        {
+            await ImportArchiveAsync(context);
+            return;
+        }
+
+        throw new ApiException(404, "not_found", "Archive endpoint not found.");
+    }
+
+    private async Task ExportArchiveAsync(HttpListenerContext context)
+    {
+        var scope = ArchiveScopeFromQuery(context.Request.QueryString);
+        using var stream = new MemoryStream();
+        ArchiveOperations.ExportToStream(_workspace, stream, scope);
+        var bytes = stream.ToArray();
+        context.Response.Headers["Content-Disposition"] = "attachment; filename=\"simpleagentchat-archive.zip\"";
+        await WriteBytesAsync(context, 200, "application/zip", bytes);
+    }
+
+    private async Task ImportArchiveAsync(HttpListenerContext context)
+    {
+        var scope = ArchiveScopeFromQuery(context.Request.QueryString);
+        var mode = ArchiveImportModeFromQuery(context.Request.QueryString);
+        var tempPath = Path.Combine(Path.GetTempPath(), "simpleagentchat-import-" + Guid.NewGuid().ToString("N") + ".zip");
+        try
+        {
+            await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                await context.Request.InputStream.CopyToAsync(output);
+                await output.FlushAsync();
+            }
+
+            var result = ArchiveOperations.ImportFromFile(_workspace, tempPath, mode, scope);
+            BroadcastArchiveEvents(scope);
+            await WriteJsonAsync(context, 200, result);
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
+    }
+
+    private void BroadcastArchiveEvents(ArchiveScope scope)
+    {
+        if (scope.Messages) BroadcastEvent("messages");
+        if (scope.Roles) BroadcastEvent("roles");
+        if (scope.Goals || scope.GoalStatus) BroadcastEvent("goals");
+        if (scope.Assets) BroadcastEvent("assets");
     }
 
     private async Task PutRoleAsync(HttpListenerContext context, string role)
@@ -3516,6 +4208,66 @@ internal sealed class LocalServer
         throw CliException.Validation("invalid_bool", $"{name} must be true or false.");
     }
 
+    private static ArchiveScope ArchiveScopeFromQuery(System.Collections.Specialized.NameValueCollection query)
+    {
+        if (TryGetQueryBool(query, "all", out var all) && all)
+        {
+            return ArchiveScope.All;
+        }
+
+        var any = false;
+        var roles = QueryScopeFlag(query, ref any, "roles");
+        var goals = QueryScopeFlag(query, ref any, "goals");
+        var goalStatus = QueryScopeFlag(query, ref any, "goalStatus", "goal-status", "goal_status", "statuses");
+        var messages = QueryScopeFlag(query, ref any, "messages");
+        var assets = QueryScopeFlag(query, ref any, "assets");
+        var scope = any ? new ArchiveScope(roles, goals, goalStatus, messages, assets) : ArchiveScope.All;
+        if (!scope.Any)
+        {
+            throw CliException.Usage("usage", "At least one archive content type must be selected.");
+        }
+
+        return scope;
+    }
+
+    private static bool QueryScopeFlag(System.Collections.Specialized.NameValueCollection query, ref bool any, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (TryGetQueryBool(query, name, out var parsed))
+            {
+                any = true;
+                return parsed;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetQueryBool(System.Collections.Specialized.NameValueCollection query, string name, out bool parsed)
+    {
+        var raw = query[name];
+        if (raw is null)
+        {
+            parsed = false;
+            return false;
+        }
+
+        parsed = ParseBool(raw, name);
+        return true;
+    }
+
+    private static ArchiveImportMode ArchiveImportModeFromQuery(System.Collections.Specialized.NameValueCollection query)
+    {
+        var mode = EmptyToNull(query["mode"]);
+        return mode switch
+        {
+            "merge" => ArchiveImportMode.Merge,
+            "replace" => ArchiveImportMode.Replace,
+            _ => throw CliException.Validation("invalid_mode", "Archive import mode must be merge or replace.")
+        };
+    }
+
     private static string? EmptyToNull(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private static async Task WriteJsonAsync(HttpListenerContext context, int statusCode, object body)
@@ -3905,6 +4657,28 @@ internal static class PlainText
             }
         }
     }
+
+    public static void WriteArchiveResult(ArchiveOperationResult result)
+    {
+        Console.Out.WriteLine($"operation: {result.Operation}");
+        if (!string.IsNullOrWhiteSpace(result.Path))
+        {
+            Console.Out.WriteLine($"path: {result.Path}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.Mode))
+        {
+            Console.Out.WriteLine($"mode: {result.Mode}");
+        }
+
+        Console.Out.WriteLine($"scope: {string.Join(",", result.Scope.Names)}");
+        Console.Out.WriteLine($"total: {result.Counts.Total}");
+        Console.Out.WriteLine($"roles: {result.Counts.Roles}");
+        Console.Out.WriteLine($"goals: {result.Counts.Goals}");
+        Console.Out.WriteLine($"goalStatus: {result.Counts.GoalStatus}");
+        Console.Out.WriteLine($"messages: {result.Counts.Messages}");
+        Console.Out.WriteLine($"assets: {result.Counts.Assets}");
+    }
 }
 
 internal static class RolePrompts
@@ -4038,6 +4812,10 @@ button:disabled{cursor:not-allowed;opacity:.55}
 .chat-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
 .critical-toggle{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;user-select:none}
 .critical-toggle input{width:auto;margin:0}
+.checkbox-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.check-tile,.mode-options label{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;background:#fff;padding:8px;font-size:13px}
+.check-tile input,.mode-options input{width:auto;margin:0}
+.mode-options{display:flex;gap:8px;flex-wrap:wrap}
 .fields{display:grid;gap:10px}
 .field{display:grid;gap:5px}
 .field span{color:var(--muted);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0}
@@ -4097,6 +4875,7 @@ button:disabled{cursor:not-allowed;opacity:.55}
 <button id="tabRoles" aria-selected="true" onclick="showTab('roles')">Roles</button>
 <button id="tabGoals" aria-selected="false" onclick="showTab('goals')">Goals</button>
 <button id="tabAssets" aria-selected="false" onclick="showTab('assets')">Assets</button>
+<button id="tabArchive" aria-selected="false" onclick="showTab('archive')">Import/Export</button>
 </div>
 <div class="body">
 <div id="rolesPanel" class="stack">
@@ -4115,6 +4894,22 @@ button:disabled{cursor:not-allowed;opacity:.55}
 <div id="assetsPanel" class="stack" hidden>
 <div class="formbar assets"><label class="field"><span>Name</span><input id="assetName" placeholder="asset.txt"></label><label class="field"><span>File</span><input id="assetFile" type="file"></label><button onclick="uploadAsset()">Upload</button></div>
 <div id="assetList" class="list"></div>
+</div>
+<div id="archivePanel" class="stack" hidden>
+<div class="checkbox-grid">
+<label class="check-tile"><input id="archiveRoles" type="checkbox" checked> Roles</label>
+<label class="check-tile"><input id="archiveGoals" type="checkbox" checked> Goals</label>
+<label class="check-tile"><input id="archiveGoalStatus" type="checkbox" checked> Goal status</label>
+<label class="check-tile"><input id="archiveMessages" type="checkbox" checked> Messages</label>
+<label class="check-tile"><input id="archiveAssets" type="checkbox" checked> Assets</label>
+</div>
+<div class="row"><button onclick="downloadArchive()">Export selected</button></div>
+<label class="field"><span>Import zip</span><input id="archiveFile" type="file" accept=".zip,application/zip"></label>
+<div class="mode-options">
+<label><input id="archiveModeMerge" name="archiveMode" type="radio" value="merge" checked> Merge</label>
+<label><input id="archiveModeReplace" name="archiveMode" type="radio" value="replace"> Replace</label>
+</div>
+<div class="row"><button class="primary" onclick="importArchive()">Import selected</button></div>
 </div>
 </div>
 </section>
@@ -4139,7 +4934,7 @@ async function loadNewMessages(){const state=chatScrollState(); const query='/ap
 async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets(),refreshChat()]); setStatus('Refreshed')}
 async function sendMessage(){const state=chatScrollState(); const data=await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; renderChat([data.message],false); chatCursor=data.nextCursor||data.message?.id||chatCursor; restoreChatScroll(state); setStatus('Sent')}
 async function exportChat(){const data=await api('/api/export-html',{method:'POST'}); setStatus('Exported '+text(data.path))}
-function showTab(name){for(const n of ['roles','goals','assets']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
+function showTab(name){for(const n of ['roles','goals','assets','archive']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
 function replaceOptions(select, values){select.textContent=''; for(const value of values){const option=document.createElement('option'); option.value=value; option.textContent=value; select.appendChild(option)}}
 function requiredValue(id){const element=$(id); const value=element.value.trim(); if(!value){element.reportValidity?.(); element.focus(); return null} return value}
 function roleDraft(){return {role:$('roleName').value.trim(),instructions:$('roleInstructions').value,memory:$('roleMemory').value}}
@@ -4169,6 +4964,11 @@ async function deleteGoal(){const name=$('goalSelect').value; if(name){await api
 async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span><button class="danger" onclick="deleteAsset('${a.name}')">Delete</button></div>`).join('')}
 async function uploadAsset(){const file=$('assetFile').files[0]; const name=$('assetName').value || file?.name; if(!file||!name)return; await fetch('/api/assets/'+encodeURIComponent(name),{method:'PUT',body:file}).then(async r=>{if(!r.ok)throw new Error(await r.text())}); await refreshAll()}
 async function deleteAsset(name){await api('/api/assets/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}
+function archiveOptions(){return [{id:'archiveRoles',param:'roles',name:'roles'},{id:'archiveGoals',param:'goals',name:'goals'},{id:'archiveGoalStatus',param:'goalStatus',name:'goal status'},{id:'archiveMessages',param:'messages',name:'messages'},{id:'archiveAssets',param:'assets',name:'assets'}]}
+function archiveScopeParams(){const params=new URLSearchParams(); for(const item of archiveOptions()){params.set(item.param,$(item.id).checked?'true':'false')} return params}
+function archiveScopeNames(){return archiveOptions().filter(item=>$(item.id).checked).map(item=>item.name)}
+async function downloadArchive(){const selected=archiveScopeNames(); if(!selected.length){setStatus('Select at least one archive item'); return} const response=await fetch('/api/archive/export?'+archiveScopeParams().toString()); if(!response.ok)throw new Error(await response.text()); const blob=await response.blob(); const url=URL.createObjectURL(blob); const link=document.createElement('a'); link.href=url; link.download='simpleagentchat-archive.zip'; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url); setStatus('Exported archive')}
+async function importArchive(){const file=$('archiveFile').files[0]; if(!file){$('archiveFile').reportValidity?.(); $('archiveFile').focus(); return} const selected=archiveScopeNames(); if(!selected.length){setStatus('Select at least one archive item'); return} const mode=$('archiveModeReplace').checked?'replace':'merge'; const prompt=(mode==='replace'?'Replace selected existing content before import?':'Merge selected archive content into this room?')+'\n\nSelected: '+selected.join(', '); if(!confirm(prompt))return; const params=archiveScopeParams(); params.set('mode',mode); const response=await fetch('/api/archive/import?'+params.toString(),{method:'POST',body:file}); if(!response.ok)throw new Error(await response.text()); const result=await response.json(); await refreshAll(); setStatus('Imported '+text(result.counts?.total||0)+' files')}
 function connectEvents(){if(!window.EventSource){setInterval(()=>{loadNewMessages().catch(e=>setStatus(e.message)); loadGoals().catch(e=>setStatus(e.message))},30000); return} const events=new EventSource('/api/events'); events.onopen=()=>setStatus('Live'); events.addEventListener('messages',()=>loadNewMessages().catch(e=>setStatus(e.message))); events.addEventListener('roles',()=>{loadRoles().catch(e=>setStatus(e.message)); loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('goals',()=>{loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('assets',()=>loadAssets().catch(e=>setStatus(e.message))); events.onerror=()=>setStatus('Reconnecting')}
 refreshAll().catch(e=>setStatus(e.message));
 connectEvents();

@@ -15,6 +15,7 @@
 - Gives each agent an explicit role with instructions and durable role memory.
 - Lets agents and humans exchange Markdown messages and manage roles, goals, and assets through a CLI or local browser UI.
 - Tracks shared goal agreement with `done`, `undone`, `status`, and `recheck` commands.
+- Imports and exports selected room content as a zip file when you want to move or snapshot goals, roles, messages, goal status, or assets.
 - Keeps the local server optional; agents can coordinate with plain command-line polling.
 
 ## Requirements
@@ -31,7 +32,7 @@
 dotnet .\simpleagentchat.cs serve
 ```
 
-- Edit your agent roles and goals in the browser-based UI that pops up, or manage roles, goals, and assets with the CLI.
+- Edit your agent roles and goals in the browser-based UI that pops up, or manage roles, goals, assets, and import/export archives with the CLI.
 - Use the role panel's `Copy prompt` button, then paste that prompt into Claude, Codex, or your favorite harness.
 - Once everything is configured, say `Start` in the chat window.
 - Watch the magic happen.

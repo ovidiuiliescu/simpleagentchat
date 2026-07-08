@@ -13,6 +13,7 @@ internal static class SimpleAgentChatTests
             ("fetch parser enforces cursor and wait rules", TestFetchParser),
             ("goal parser handles status, mark, and recheck forms", TestGoalParser),
             ("role and asset parsers handle resource management forms", TestRoleAndAssetParsers),
+            ("archive parser handles scope and import mode", TestArchiveParser),
             ("serve parser handles port and browser options", TestServeParser),
             ("markdown renderer escapes raw html", TestMarkdownEscaping),
             ("markdown renderer covers common chat shapes", TestMarkdownCommonShapes),
@@ -21,6 +22,7 @@ internal static class SimpleAgentChatTests
             ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
             ("role join prompt clearly explains how to join", TestRoleJoinPromptIsClear),
             ("resource operations manage roles goals and assets", TestResourceOperationsManageFiles),
+            ("archive operations export and import selected room files", TestArchiveOperations),
             ("ui shell exposes single role save, export, and management controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
             ("goal status store computes current role completion", TestGoalStatusStore),
@@ -173,6 +175,35 @@ internal static class SimpleAgentChatTests
 
         AssertThrows<CliException>(() => RoleCommandArgs.Parse(new[] { "update", "observer" }), "role update requires a file option");
         AssertThrows<CliException>(() => AssetCommandArgs.Parse(new[] { "add", "report.md" }), "asset add requires file");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestArchiveParser()
+    {
+        var export = ArchiveCommandArgs.Parse(new[] { "export", "room.zip", "--roles", "--messages", "--json" });
+        AssertEqual("export", export.Action, "archive export action");
+        AssertEqual("room.zip", export.FilePath, "archive export path");
+        Assert(export.Scope.Roles, "archive export should include roles");
+        Assert(export.Scope.Messages, "archive export should include messages");
+        Assert(!export.Scope.Goals, "archive export should not include unselected goals");
+        Assert(export.Json, "archive export json");
+
+        var exportDefault = ArchiveCommandArgs.Parse(new[] { "export", "room.zip" });
+        Assert(exportDefault.Scope.Roles && exportDefault.Scope.Goals && exportDefault.Scope.GoalStatus && exportDefault.Scope.Messages && exportDefault.Scope.Assets, "archive export default scope should include all content");
+
+        var importReplace = ArchiveCommandArgs.Parse(new[] { "import", "room.zip", "--replace", "--goals", "--goal-status" });
+        AssertEqual("import", importReplace.Action, "archive import action");
+        AssertEqual(ArchiveImportMode.Replace, importReplace.ImportMode!.Value, "archive import replace mode");
+        Assert(importReplace.Scope.Goals, "archive import should include goals");
+        Assert(importReplace.Scope.GoalStatus, "archive import should include goal status");
+        Assert(!importReplace.Scope.Roles, "archive import should not include unselected roles");
+
+        var importMerge = ArchiveCommandArgs.Parse(new[] { "import", "room.zip", "--mode", "merge" });
+        AssertEqual(ArchiveImportMode.Merge, importMerge.ImportMode!.Value, "archive import mode option");
+
+        AssertThrows<CliException>(() => ArchiveCommandArgs.Parse(new[] { "import", "room.zip" }), "archive import should require mode");
+        AssertThrows<CliException>(() => ArchiveCommandArgs.Parse(new[] { "import", "room.zip", "--merge", "--replace" }), "archive import should reject mixed modes");
+        AssertThrows<CliException>(() => ArchiveCommandArgs.Parse(new[] { "export", "room.zip", "--merge" }), "archive export should reject import mode");
         return Task.CompletedTask;
     }
 
@@ -415,6 +446,70 @@ internal static class SimpleAgentChatTests
         }
     }
 
+    private static async Task TestArchiveOperations()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        var sourceRoot = Path.Combine(root, "source");
+        var destinationRoot = Path.Combine(root, "destination");
+        var mergeRoot = Path.Combine(root, "merge");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(destinationRoot);
+        Directory.CreateDirectory(mergeRoot);
+        try
+        {
+            var source = ChatWorkspace.Initialize(sourceRoot);
+            source.EnsureRoleFiles("observer");
+            File.WriteAllText(Path.Combine(source.RoleDirectory("observer"), "instructions.md"), "# Observer\n\nWatch imports.\n");
+            File.WriteAllText(source.GoalPath("release.md"), "# Release\n\nShip it.\n");
+            File.WriteAllText(source.AssetPath("notes.txt"), "source asset");
+            await new MessageStore(source).AppendAsync("implementer", "chat.message", "source message", Array.Empty<string>(), 0);
+            await new GoalStatusStore(source).MarkRoleStatusAsync("release.md", "implementer", "done", 0);
+
+            var zipPath = Path.Combine(root, "room.zip");
+            var export = ArchiveOperations.ExportToFile(source, zipPath, ArchiveScope.All);
+            Assert(File.Exists(zipPath), "archive zip should be created");
+            Assert(export.Counts.Roles >= 6, "archive should include role instruction and memory files");
+            AssertEqual(1, export.Counts.Goals, "archive should include one goal");
+            AssertEqual(1, export.Counts.GoalStatus, "archive should include one goal status file");
+            Assert(export.Counts.Messages >= 2, "archive should include chat and goal status messages");
+            AssertEqual(1, export.Counts.Assets, "archive should include one asset");
+
+            var destination = ChatWorkspace.Initialize(destinationRoot);
+            destination.EnsureRoleFiles("legacy");
+            File.WriteAllText(destination.GoalPath("old.md"), "# Old\n");
+            File.WriteAllText(destination.AssetPath("old.txt"), "old asset");
+            await new MessageStore(destination).AppendAsync("implementer", "chat.message", "old message", Array.Empty<string>(), 0);
+
+            var imported = ArchiveOperations.ImportFromFile(destination, zipPath, ArchiveImportMode.Replace, ArchiveScope.All);
+            AssertEqual(export.Counts.Goals, imported.Counts.Goals, "replace import goal count");
+            Assert(File.Exists(destination.GoalPath("release.md")), "replace import should copy selected goals");
+            Assert(!File.Exists(destination.GoalPath("old.md")), "replace import should remove existing selected goals");
+            Assert(File.Exists(destination.GoalStatusPath("release.md")), "replace import should copy goal status");
+            Assert(File.Exists(destination.AssetPath("notes.txt")), "replace import should copy selected assets");
+            Assert(!File.Exists(destination.AssetPath("old.txt")), "replace import should remove existing selected assets");
+            Assert(Directory.Exists(destination.RoleDirectory("observer")), "replace import should copy selected roles");
+            Assert(!Directory.Exists(destination.RoleDirectory("legacy")), "replace import should remove existing selected roles");
+            Assert(File.ReadAllText(Path.Combine(destination.RoleDirectory("observer"), "instructions.md")).Contains("Watch imports.", StringComparison.Ordinal), "role instructions should round trip");
+            var messages = new MessageStore(destination).ReadAllMessages();
+            Assert(messages.Any(message => message.Markdown == "source message"), "replace import should copy selected messages");
+            Assert(!messages.Any(message => message.Markdown == "old message"), "replace import should remove existing selected messages");
+
+            var merge = ChatWorkspace.Initialize(mergeRoot);
+            var goalOnly = new ArchiveScope(false, true, false, false, false);
+            ArchiveOperations.ImportFromFile(merge, zipPath, ArchiveImportMode.Merge, goalOnly);
+            Assert(File.Exists(merge.GoalPath("release.md")), "merge import should copy selected goals");
+            Assert(!File.Exists(merge.AssetPath("notes.txt")), "merge import should not copy unselected assets");
+            Assert(!new MessageStore(merge).ReadAllMessages().Any(message => message.Markdown == "source message"), "merge import should not copy unselected messages");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static Task TestInitializationMovesLegacyHowToChat()
     {
         var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
@@ -477,6 +572,14 @@ internal static class SimpleAgentChatTests
         Assert(UiShell.Html.Contains("renameGoal()", StringComparison.Ordinal), "goal rename action missing");
         Assert(UiShell.Html.Contains("saveGoal()", StringComparison.Ordinal), "goal save action missing");
         Assert(UiShell.Html.Contains("deleteAsset", StringComparison.Ordinal), "asset delete action missing");
+        Assert(UiShell.Html.Contains("tabArchive", StringComparison.Ordinal), "import/export tab missing");
+        Assert(UiShell.Html.Contains("archiveGoalStatus", StringComparison.Ordinal), "archive goal status checkbox missing");
+        Assert(UiShell.Html.Contains("downloadArchive()", StringComparison.Ordinal), "archive export action missing");
+        Assert(UiShell.Html.Contains("importArchive()", StringComparison.Ordinal), "archive import action missing");
+        Assert(UiShell.Html.Contains("/api/archive/export?", StringComparison.Ordinal), "archive export endpoint call missing");
+        Assert(UiShell.Html.Contains("/api/archive/import?", StringComparison.Ordinal), "archive import endpoint call missing");
+        Assert(UiShell.Html.Contains("archiveModeReplace", StringComparison.Ordinal), "archive replace mode control missing");
+        Assert(UiShell.Html.Contains("confirm(prompt)", StringComparison.Ordinal), "archive import confirmation missing");
         Assert(UiShell.Html.Contains("id=\"goalStatus\"", StringComparison.Ordinal), "goal status panel missing");
         Assert(UiShell.Html.Contains("renderGoalStatuses", StringComparison.Ordinal), "goal status renderer missing");
         Assert(UiShell.Html.Contains("goal.status||{}", StringComparison.Ordinal), "goal status data binding missing");

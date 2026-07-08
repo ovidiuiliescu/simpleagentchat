@@ -36,6 +36,8 @@ dotnet simpleagentchat.cs asset list
 dotnet simpleagentchat.cs asset add <asset_name> --from <path>
 dotnet simpleagentchat.cs asset update <asset_name> --from <path>
 dotnet simpleagentchat.cs asset remove <asset_name>
+dotnet simpleagentchat.cs archive export <zip_path> [--roles] [--goals] [--goal-status] [--messages] [--assets] [--json]
+dotnet simpleagentchat.cs archive import <zip_path> (--merge|--replace) [--roles] [--goals] [--goal-status] [--messages] [--assets] [--json]
 dotnet simpleagentchat.cs export-html
 ```
 
@@ -344,6 +346,7 @@ This is the local-server UI shell used by `serve`. It must include:
 - goal editor
 - current per-role completion status for every goal
 - asset browser or upload form
+- import/export tab for selected roles, goals, goal status, messages, and assets
 - controls for sending critical messages
 - a chat export control that writes `.simpleagentchat/chat.html`
 
@@ -794,6 +797,36 @@ Validation:
 
 `asset remove` deletes `.simpleagentchat/assets/<asset_name>` and prints the asset name.
 
+### `archive`
+
+```powershell
+dotnet simpleagentchat.cs archive export <zip_path> [--roles] [--goals] [--goal-status] [--messages] [--assets] [--json]
+dotnet simpleagentchat.cs archive import <zip_path> (--merge|--replace) [--roles] [--goals] [--goal-status] [--messages] [--assets] [--json]
+```
+
+The `archive` command exports or imports selected canonical files under `.simpleagentchat/` as a zip archive.
+
+If no content flags are supplied, archive commands include all supported content types. Supported content flags are `--roles`, `--goals`, `--goal-status`, `--messages`, and `--assets`.
+
+Archive paths are relative to `.simpleagentchat/`:
+
+- `roles/<role>/instructions.md`
+- `roles/<role>/role_memory.md`
+- `goals/<goal_file_name>`
+- `goal_status/<goal_file_name>.status.json`
+- `messages/<message_id>.json`
+- `assets/<asset_name>`
+
+Role-local source copies and runner build outputs are generated artifacts and must not be exported. After importing roles, the tool refreshes each imported role's generated source copy and runner from the current repository.
+
+Import only extracts recognized safe entries. It must ignore archive entries with path traversal, nested unsupported paths, unsafe role names, unsafe goal or asset names, invalid message cursors, or unsupported role files.
+
+`archive import --merge` copies selected archive entries over matching current files and leaves unrelated current files in selected folders alone.
+
+`archive import --replace` clears selected content folders first, then copies selected archive entries. The browser UI must ask the human to confirm merge or replace before importing.
+
+Plain-text output reports the operation, path, mode when importing, selected scope, and per-content-type file counts. With `--json`, the same result is emitted as JSON.
+
 ## Message Model
 
 Each message must be represented by a JSON file with this shape:
@@ -1044,6 +1077,8 @@ GET  /chat.html
 GET  /api/messages?cursor=<cursor>&waitMs=<ms>&includeSystem=<bool>
 GET  /api/events
 POST /api/export-html
+GET  /api/archive/export?roles=<bool>&goals=<bool>&goalStatus=<bool>&messages=<bool>&assets=<bool>
+POST /api/archive/import?mode=<merge|replace>&roles=<bool>&goals=<bool>&goalStatus=<bool>&messages=<bool>&assets=<bool>
 POST /api/messages
 GET  /api/roles
 POST /api/roles
@@ -1072,6 +1107,8 @@ Endpoint contracts:
 - `GET /api/messages` returns the same core JSON schema as `fetch --json`, with an additional `html` field on each message for safe browser rendering. For UI use and cursor-based polling, `includeSystem` should default to `true`; for no-cursor agent CLI fetches it defaults to `false`.
 - `GET /api/events` returns a Server-Sent Events stream that notifies browser clients when messages, roles, goals, goal status files, or assets change. The server should watch the chat files so messages written by agent CLI commands refresh the browser UI without manual polling.
 - `POST /api/export-html` regenerates `.simpleagentchat/chat.html` with the same renderer used by `export-html` and returns the saved file path plus the read-only transcript URL.
+- `GET /api/archive/export` returns a zip archive containing the selected canonical `.simpleagentchat/` content. If no content query flags are supplied, it exports all supported content types.
+- `POST /api/archive/import` accepts a zip request body, requires `mode=merge` or `mode=replace`, imports only the selected recognized safe entries, refreshes generated role files after role import, returns per-content-type counts, and notifies browser clients for selected content types.
 - `POST /api/messages` accepts `{ "markdown": "...", "critical": false }`, writes a `human` message, and returns the created message object plus `nextCursor`. If `critical` is `true` and the trimmed Markdown does not start with `!`, the server prepends `! ` before writing the message.
 - `GET /api/roles` returns role names and metadata for valid role directories.
 - `POST /api/roles` accepts `{ "role": "...", "instructions": "...", "memory": "..." }`, creates a new role, creates and builds that role's local runner, rejects existing roles, and emits a `roles.changed` system message.
@@ -1096,7 +1133,7 @@ Asset boundaries:
 
 - Asset names must pass the safe asset filename rules.
 - v1 asset upload should reject files larger than `25 MiB`.
-- v1 should not unpack archives or create nested directories.
+- Asset upload should not unpack uploaded asset archives or create nested asset directories.
 - Assets should be served with conservative content types. Unknown types should use `application/octet-stream`.
 - Asset responses must include `X-Content-Type-Options: nosniff`.
 - The server must not serve uploaded active content as executable same-origin browser content. Files with active or script-like extensions such as `.html`, `.htm`, `.svg`, `.xml`, `.js`, `.mjs`, and `.css` must be served as `application/octet-stream` or inert text with `Content-Disposition: attachment`.
@@ -1138,6 +1175,8 @@ A successful v1 should support:
 - The CLI can list, add, update, and remove roles.
 - The CLI can list, add, update, and remove goals.
 - The CLI can list, add, update, and remove assets.
+- The CLI can export and import selected roles, goals, goal status, messages, and assets as a zip archive.
+- The browser UI can export and import selected room content and asks whether imports should merge or replace selected existing content.
 - Role and goal changes produce visible `system` messages.
 - Human/UI role memory changes produce visible `system` messages.
 - Agent-authored direct role memory updates do not need to produce `system` messages.
