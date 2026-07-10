@@ -26,6 +26,20 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
+// Section index (search for "#region NN"):
+// 01 Entry point and command dispatch
+// 02 CLI arguments and parsing
+// 03 Validation, repository discovery, and workspace initialization
+// 04 Goal status and shared models
+// 05 Role, goal, and asset operations
+// 06 Archive import and export
+// 07 Local HTTP server
+// 08 Message storage and agent-facing output
+// 09 HTML, browser UI, and Markdown rendering
+// 10 Atomic I/O, locking, retry, time, and JSON helpers
+
+#region 01 - Entry Point and Command Dispatch
+
 internal static class Program
 {
     public static async Task<int> MainAsync(string[] args)
@@ -34,7 +48,7 @@ internal static class Program
         {
             if (args.Length == 0)
             {
-                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|say|fetch|role|goal|asset|archive|export-html> ...");
+                throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs <init|serve|join|say|fetch|role|goal|asset|archive|export-html> ...");
             }
 
             ErrorWriter.JsonMode = WantsJsonErrors(args);
@@ -45,6 +59,7 @@ internal static class Program
                 "init" => await Commands.InitAsync(rest),
                 "say" => await Commands.SayAsync(rest),
                 "fetch" => await Commands.FetchAsync(rest),
+                "join" => await Commands.JoinAsync(rest),
                 "role" => await Commands.RoleAsync(rest),
                 "goal" => await Commands.GoalAsync(rest),
                 "asset" => await Commands.AssetAsync(rest),
@@ -69,7 +84,7 @@ internal static class Program
     private static bool WantsJsonErrors(string[] args)
     {
         return args.Length > 1 &&
-               (args[0] == "fetch" || args[0] == "role" || args[0] == "goal" || args[0] == "asset" || args[0] == "archive") &&
+               (args[0] == "fetch" || args[0] == "join" || args[0] == "role" || args[0] == "goal" || args[0] == "asset" || args[0] == "archive") &&
                args.Skip(1).Any(arg => arg == "--json");
     }
 }
@@ -128,6 +143,44 @@ internal static class Commands
         else
         {
             PlainText.WriteFetch(response);
+        }
+
+        return 0;
+    }
+
+    public static async Task<int> JoinAsync(string[] args)
+    {
+        var parsed = JoinArgs.Parse(args);
+        ErrorWriter.JsonMode = parsed.Json;
+        var root = RepositoryRoot.FindRequired();
+        var workspace = ChatWorkspace.OpenExisting(root);
+        var roleDirectory = workspace.RoleDirectory(parsed.Role);
+        if (!Directory.Exists(roleDirectory))
+        {
+            throw CliException.Validation("missing_role", $"Role '{parsed.Role}' does not exist.");
+        }
+
+        var fetch = await new MessageStore(workspace).FetchAsync(cursor: null, includeSystem: false, waitMs: 0);
+        var goals = workspace.GetGoalNames().Select(name => new JoinGoal(
+            name,
+            File.ReadAllText(workspace.GoalPath(name), Encoding.UTF8),
+            new GoalStatusStore(workspace).GetStatus(name))).ToArray();
+        var response = new JoinResponse(
+            parsed.Role,
+            File.ReadAllText(Path.Combine(roleDirectory, "instructions.md"), Encoding.UTF8),
+            File.ReadAllText(Path.Combine(roleDirectory, "role_memory.md"), Encoding.UTF8),
+            goals,
+            fetch.Messages.Any(message => message.Role == "human" && message.Markdown == "Start"),
+            fetch.NextCursor,
+            fetch.Messages);
+
+        if (parsed.Json)
+        {
+            Console.Out.WriteLine(Json.Text(response));
+        }
+        else
+        {
+            PlainText.WriteJoin(response);
         }
 
         return 0;
@@ -432,6 +485,10 @@ internal static class ErrorWriter
     }
 }
 
+#endregion
+
+#region 02 - CLI Arguments and Parsing
+
 internal sealed record SayArgs(string Role, int WaitMs, string? InlineMarkdown, bool UseStdin, string? FilePath)
 {
     public static SayArgs Parse(string[] args)
@@ -466,7 +523,7 @@ internal sealed record SayArgs(string Role, int WaitMs, string? InlineMarkdown, 
                     throw CliException.Usage("usage", "--wait-ms requires a value.");
                 }
 
-                waitMs = ParseWaitMs(args[i + 1]);
+                waitMs = CliParsing.ParseWaitMs(args[i + 1]);
                 i += 2;
                 continue;
             }
@@ -529,15 +586,6 @@ internal sealed record SayArgs(string Role, int WaitMs, string? InlineMarkdown, 
         return InlineMarkdown ?? "";
     }
 
-    private static int ParseWaitMs(string value)
-    {
-        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var waitMs) || waitMs < 0)
-        {
-            throw CliException.Validation("invalid_wait_ms", "wait-ms must be an integer from 0 through 2147483647.");
-        }
-
-        return waitMs;
-    }
 }
 
 internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool IncludeSystem)
@@ -575,7 +623,7 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
                     throw CliException.Usage("usage", "--wait-ms requires a value.");
                 }
 
-                waitMs = ParseWaitMs(args[++i]);
+                waitMs = CliParsing.ParseWaitMs(args[++i]);
                 continue;
             }
 
@@ -603,7 +651,7 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
 
         if (positionals.Count == 2)
         {
-            positionalWaitMs = ParseWaitMs(positionals[1]);
+            positionalWaitMs = CliParsing.ParseWaitMs(positionals[1]);
         }
 
         if (waitMs.HasValue && positionalWaitMs.HasValue)
@@ -616,14 +664,30 @@ internal sealed record FetchArgs(string? Cursor, int WaitMs, bool Json, bool Inc
         return new FetchArgs(cursor, finalWaitMs, json, finalIncludeSystem);
     }
 
-    private static int ParseWaitMs(string value)
+}
+
+internal sealed record JoinArgs(string Role, bool Json)
+{
+    public static JoinArgs Parse(string[] args)
     {
-        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var waitMs) || waitMs < 0)
+        if (args.Length is < 1 or > 2)
         {
-            throw CliException.Validation("invalid_wait_ms", "wait-ms must be an integer from 0 through 2147483647.");
+            throw CliException.Usage("usage", "Usage: dotnet simpleagentchat.cs join <role> [--json]");
         }
 
-        return waitMs;
+        var role = args[0];
+        if (!NameRules.IsValidRoleName(role, allowReserved: false))
+        {
+            throw CliException.Validation("invalid_role", "Role is not a valid current agent role name.");
+        }
+
+        var json = args.Length == 2 && args[1] == "--json";
+        if (args.Length == 2 && !json)
+        {
+            throw CliException.Usage("usage", $"Unknown option '{args[1]}'.");
+        }
+
+        return new JoinArgs(role, json);
     }
 }
 
@@ -1373,6 +1437,10 @@ internal static class CliParsing
     }
 }
 
+#endregion
+
+#region 03 - Validation, Repository Discovery, and Workspace Initialization
+
 internal static partial class NameRules
 {
     private static readonly Regex RoleRegex = new("^[a-z][a-z0-9_-]{0,63}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -1549,6 +1617,9 @@ internal sealed class ChatWorkspace
     public string GoalStatusDir { get; }
     public string MessagesDir { get; }
     public string RolesDir { get; }
+    public string RunnerSourcePath { get; }
+    public string RunnerDirectory { get; }
+    public string RunnerDllPath { get; }
     public string StatePath { get; }
     public string ChatHtmlPath { get; }
     public string UiHtmlPath { get; }
@@ -1565,6 +1636,9 @@ internal sealed class ChatWorkspace
         GoalStatusDir = Path.Combine(ChatDir, "goal_status");
         MessagesDir = Path.Combine(ChatDir, "messages");
         RolesDir = Path.Combine(ChatDir, "roles");
+        RunnerSourcePath = Path.Combine(ChatDir, "simpleagentchat-runner.cs");
+        RunnerDirectory = Path.Combine(ChatDir, "runner");
+        RunnerDllPath = Path.Combine(RunnerDirectory, "simpleagentchat-runner.dll");
         StatePath = Path.Combine(ChatDir, "state.json");
         ChatHtmlPath = Path.Combine(ChatDir, "chat.html");
         UiHtmlPath = Path.Combine(ChatDir, "ui.html");
@@ -1596,6 +1670,8 @@ internal sealed class ChatWorkspace
             workspace.EnsureRoleFiles(role);
         }
 
+        workspace.EnsureSharedRunner();
+
         workspace.EnsureGitIgnore();
         workspace.EnsureInstructionFiles();
         workspace.EnsureStateFile();
@@ -1623,21 +1699,6 @@ internal sealed class ChatWorkspace
         }
 
         return SafeCombine(RolesDir, role);
-    }
-
-    public string RoleSourcePath(string role)
-    {
-        return Path.Combine(RoleDirectory(role), RoleSourceFileName(role));
-    }
-
-    public string RoleRunnerDirectory(string role)
-    {
-        return Path.Combine(RoleDirectory(role), "runner");
-    }
-
-    public string RoleRunnerDllPath(string role)
-    {
-        return Path.Combine(RoleRunnerDirectory(role), Path.GetFileNameWithoutExtension(RoleSourceFileName(role)) + ".dll");
     }
 
     public string GoalPath(string name)
@@ -1761,54 +1822,31 @@ internal sealed class ChatWorkspace
             Atomic.WriteText(memoryPath, "# Role Memory\n\nNo durable notes yet.\n");
         }
 
-        var sourceUpdated = EnsureRoleSource(role);
-        EnsureRoleRunner(role, sourceUpdated);
     }
 
-    private bool EnsureRoleSource(string role)
+    public void EnsureSharedRunner()
     {
         var sourcePath = Path.Combine(Root, "simpleagentchat.cs");
         if (!File.Exists(sourcePath))
         {
-            return false;
+            return;
         }
 
-        var dir = RoleDirectory(role);
-        var targetPath = RoleSourcePath(role);
-        foreach (var existing in Directory.EnumerateFiles(dir, "simpleagentchat-*.cs"))
-        {
-            if (!string.Equals(Path.GetFullPath(existing), Path.GetFullPath(targetPath), StringComparison.OrdinalIgnoreCase))
-            {
-                File.Delete(existing);
-            }
-        }
-
+        using var mutationLock = WorkspaceLock.Acquire(this, 30000);
         var source = File.ReadAllText(sourcePath, Encoding.UTF8);
-        if (File.Exists(targetPath) && string.Equals(File.ReadAllText(targetPath, Encoding.UTF8), source, StringComparison.Ordinal))
+        var sourceUpdated = !File.Exists(RunnerSourcePath) ||
+                            !string.Equals(File.ReadAllText(RunnerSourcePath, Encoding.UTF8), source, StringComparison.Ordinal);
+        if (sourceUpdated)
         {
-            return false;
+            Atomic.WriteText(RunnerSourcePath, source);
         }
 
-        Atomic.WriteText(targetPath, source);
-        return true;
-    }
-
-    private void EnsureRoleRunner(string role, bool sourceUpdated)
-    {
-        var sourcePath = RoleSourcePath(role);
-        if (!File.Exists(sourcePath))
+        if (!sourceUpdated && File.Exists(RunnerDllPath))
         {
             return;
         }
 
-        var runnerDir = RoleRunnerDirectory(role);
-        var runnerDll = RoleRunnerDllPath(role);
-        if (!sourceUpdated && File.Exists(runnerDll))
-        {
-            return;
-        }
-
-        Directory.CreateDirectory(runnerDir);
+        Directory.CreateDirectory(RunnerDirectory);
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
         {
@@ -1819,15 +1857,15 @@ internal sealed class ChatWorkspace
             CreateNoWindow = true
         };
         process.StartInfo.ArgumentList.Add("build");
-        process.StartInfo.ArgumentList.Add(sourcePath);
+        process.StartInfo.ArgumentList.Add(RunnerSourcePath);
         process.StartInfo.ArgumentList.Add("--output");
-        process.StartInfo.ArgumentList.Add(runnerDir);
+        process.StartInfo.ArgumentList.Add(RunnerDirectory);
 
         try
         {
             if (!process.Start())
             {
-                throw CliException.Validation("role_runner_build_failed", $"Could not start dotnet build for role '{role}'.");
+                throw CliException.Validation("runner_build_failed", "Could not start the shared simpleagentchat runner build.");
             }
 
             var output = process.StandardOutput.ReadToEnd();
@@ -1836,7 +1874,7 @@ internal sealed class ChatWorkspace
             if (process.ExitCode != 0)
             {
                 var details = string.Join("\n", new[] { output.Trim(), error.Trim() }.Where(text => text.Length > 0));
-                throw CliException.Validation("role_runner_build_failed", $"Could not build runner for role '{role}'. {details}".TrimEnd());
+                throw CliException.Validation("runner_build_failed", $"Could not build the shared simpleagentchat runner. {details}".TrimEnd());
             }
         }
         catch (CliException)
@@ -1845,11 +1883,9 @@ internal sealed class ChatWorkspace
         }
         catch (Exception ex)
         {
-            throw CliException.Validation("role_runner_build_failed", $"Could not build runner for role '{role}': {ex.Message}");
+            throw CliException.Validation("runner_build_failed", $"Could not build the shared simpleagentchat runner: {ex.Message}");
         }
     }
-
-    private static string RoleSourceFileName(string role) => $"simpleagentchat-{role}.cs";
 
     private void EnsureGitIgnore()
     {
@@ -1880,7 +1916,7 @@ internal sealed class ChatWorkspace
         MarkedBlock.Upsert(HowToChatPath, howBlock);
         RemoveLegacyRootHowToChatGuide();
         var agentsBlock = "If you are asked to join a simpleagentchat chat, read `.simpleagentchat/HOW_TO_CHAT.md` first and follow it.\n" +
-                          "While in simpleagentchat mode, always keep polling until you are explicitly instructed not to, even when you think no further polling is needed. If a long poll returns no messages or times out, continue polling; otherwise, you may miss messages.\n" +
+                          "While actively working in simpleagentchat mode, poll from the latest cursor at meaningful checkpoints. After your handoff, perform one final fetch and then leave unless a human explicitly asked you to keep monitoring.\n" +
                           "While in simpleagentchat mode, always announce whenever something you do might be of meaningful interest to others, including code changes, environment changes, test results, or other shared state changes.\n";
         MarkedBlock.Upsert(AgentsPath, agentsBlock);
     }
@@ -2004,20 +2040,21 @@ The active chat lives in `.simpleagentchat/`.
 
 Command forms:
 
-- Always run chat commands through your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json`.
+- Always run chat commands through the prebuilt shared runner, for example `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll fetch --wait-ms 0 --json`.
 - Examples below use `reviewer`; replace it with your assigned role name.
-- The room creates and refreshes `.simpleagentchat/roles/<role>/simpleagentchat-<role>.cs` and `.simpleagentchat/roles/<role>/runner/` when roles are created, renamed, or initialized.
-- If your role-local runner is missing, stop and ask the human to refresh the role setup before joining.
+- The room creates and refreshes `.simpleagentchat/simpleagentchat-runner.cs` and `.simpleagentchat/runner/` when it is initialized.
+- If the shared runner is missing, stop and ask the human to refresh the room setup before joining.
 - Human setup or solo maintenance can still use `dotnet simpleagentchat.cs <command> ...`.
-- The contention happens in the .NET file-based app build cache, not in simpleagentchat's message files: concurrent builds of the same `.cs` file target the same cached DLL. Role-local source copies give each role a separate build-cache identity, and agents run the already-built DLL.
-- Do not repair `%TEMP%\dotnet\runfile` by hand; agents should use the role-local runner.
+- The contention happens in the .NET file-based app build cache, not in simpleagentchat's message files. Agents avoid it by sharing one already-built runner DLL instead of invoking the root source file.
+- Do not repair `%TEMP%\dotnet\runfile` by hand; agents should use the shared prebuilt runner.
 
 Before joining as an agent:
 
-- Fetch all prior messages with your role-local runner, for example `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json`.
+- Prefer the one-step context command `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll join reviewer --json`; it returns role instructions, memory, goals, current goal status, prior chat, and the next cursor.
+- If you need chat history alone, fetch it with `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll fetch --wait-ms 0 --json`.
 - Initial fetches with no cursor omit historical `system` messages by default; current role files, goal files, and role memory are authoritative.
 - Preserve the returned `nextCursor`, even when messages were filtered out.
-- CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening. Do not stop just because all current goals are done; new goals can appear after completion. If no messages are available yet, do not stop; run a long wait such as `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 600000 --json` and repeat it after timeouts so you can respond to incoming messages.
+- While actively working, listen for new chat messages with `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll fetch <nextCursor> --wait-ms 600000 --json` and repeat after timeouts.
 - Read all files in `.simpleagentchat/goals/`.
 - Read `.simpleagentchat/roles/<role>/instructions.md`.
 - Read `.simpleagentchat/roles/<role>/role_memory.md`.
@@ -2027,23 +2064,24 @@ Before joining as an agent:
 During work:
 
 - Fetch from your latest fetched cursor before each meaningful step and at least every 2-3 minutes while you are doing actual work.
-- Keep a long-poll fetch active or repeat long waits from your latest fetched cursor until a fetched message explicitly tells you not to listen. A `timedOut: true` response means no message arrived during that wait, not that you may stop listening. Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added.
+- A `timedOut: true` response means no message arrived during that wait. Continue polling while you are actively working or have been asked to monitor the room.
 - Do not advance your fetch cursor from your own `say` result. Advance it only from `fetch`.
 - To improve collaboration, inform the chat when you complete a large or important chunk of work, find anything of interest, are about to make a big change, or want the opinion of other participants. Keep these updates concise and avoid spamming routine activity.
 - Obey critical messages that start with `!` immediately.
 - Obey newly fetched `system` messages immediately.
 - Re-read role instructions, role memory, and goals when instructed.
 - When your role finishes its part, send a handoff message that says what changed or what work was done and what your conclusion is.
+- After the handoff, perform one final fetch. You may then leave the session unless a human asked you to keep monitoring; future work can rejoin the same durable role context.
 - Stop if your role directory no longer exists.
 - Put assets in `.simpleagentchat/assets/` before referencing them.
 
 Goal completion:
 
 - A goal is complete only when every current valid role has publicly marked it done.
-- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal status <goal_file_name>` before claiming a goal is complete.
-- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal done <role> <goal_file_name>` only after checking the goal from your role's responsibility.
-- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal undone <role> <goal_file_name>` when new evidence invalidates previous agreement.
-- Use `dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll goal recheck <goal_file_name> <reason>` when important changes require every role to re-check and re-approve.
+- Use `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll goal status <goal_file_name>` before claiming a goal is complete.
+- Use `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll goal done <role> <goal_file_name>` only after checking the goal from your role's responsibility.
+- Use `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll goal undone <role> <goal_file_name>` when new evidence invalidates previous agreement.
+- Use `dotnet .simpleagentchat/runner/simpleagentchat-runner.dll goal recheck <goal_file_name> <reason>` when important changes require every role to re-check and re-approve.
 
 Roles:
 
@@ -2053,6 +2091,10 @@ Roles:
 - All chat is public.
 """;
 }
+
+#endregion
+
+#region 04 - Goal Status and Shared Models
 
 internal sealed class GoalStatusStore
 {
@@ -2107,8 +2149,9 @@ internal sealed class GoalStatusStore
             ? $"Role `{role}` marked goal `{goalName}` done."
             : $"Role `{role}` marked goal `{goalName}` undone.";
         var kind = status == "done" ? "goals.done" : "goals.undone";
-        var message = MessageStore.NewMessage(role, kind, markdown, new[] { statusPath });
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, waitMs);
+        var message = store.NewMessageUnderLock(role, kind, markdown, new[] { statusPath });
         await Retry.WithinAsync(waitMs, async () =>
         {
             var document = NormalizeDocument(goalName, ReadDocument(goalName));
@@ -2136,12 +2179,13 @@ internal sealed class GoalStatusStore
 
         var store = new MessageStore(_workspace);
         var statusPath = RootRelative(_workspace.GoalStatusPath(goalName));
-        var system = MessageStore.NewMessage(
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, waitMs);
+        var system = store.NewMessageUnderLock(
             "system",
             "goals.recheck",
             $"Goals changed. All current roles must re-check and re-approve `{goalName}`.",
             new[] { statusPath, RootRelative(_workspace.GoalPath(goalName)) });
-        var goalMessage = MessageStore.NewMessage("goal", "chat.message", reason, Array.Empty<string>());
+        var goalMessage = store.NewMessageUnderLock("goal", "chat.message", reason, Array.Empty<string>());
 
         await Retry.WithinAsync(waitMs, async () =>
         {
@@ -2347,8 +2391,14 @@ internal enum ArchiveGroup
     Assets
 }
 
-internal static class ResourceOperations
+#endregion
+
+#region 05 - Role, Goal, and Asset Operations
+
+internal static partial class ResourceOperations
 {
+    #region Roles
+
     public static IReadOnlyList<RoleListItem> ListRoles(ChatWorkspace workspace) =>
         workspace.GetRoleNames()
             .Select(role =>
@@ -2379,6 +2429,7 @@ internal static class ResourceOperations
         }
 
         workspace.EnsureRoleFiles(role);
+        workspace.EnsureSharedRunner();
         var instructionsPath = Path.Combine(dir, "instructions.md");
         var memoryPath = Path.Combine(dir, "role_memory.md");
         if (instructions is not null)
@@ -2395,7 +2446,7 @@ internal static class ResourceOperations
             "system",
             "roles.changed",
             "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, memoryPath), RootRelative(workspace, workspace.RoleSourcePath(role)) },
+            new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, memoryPath), RootRelative(workspace, workspace.RunnerSourcePath) },
             waitMs);
         return new RoleSaveResult(created, message);
     }
@@ -2417,6 +2468,7 @@ internal static class ResourceOperations
         var instructions = args.InstructionsFile is null ? null : ReadTextFile(args.InstructionsFile, "--instructions");
         var memory = args.MemoryFile is null ? null : ReadTextFile(args.MemoryFile, "--memory");
         workspace.EnsureRoleFiles(role);
+        workspace.EnsureSharedRunner();
         var instructionsPath = Path.Combine(dir, "instructions.md");
         var memoryPath = Path.Combine(dir, "role_memory.md");
         if (instructions is not null)
@@ -2433,7 +2485,7 @@ internal static class ResourceOperations
             "system",
             "roles.changed",
             "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, memoryPath), RootRelative(workspace, workspace.RoleSourcePath(role)) },
+            new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, memoryPath), RootRelative(workspace, workspace.RunnerSourcePath) },
             args.WaitMs);
         return new[] { message };
     }
@@ -2460,6 +2512,7 @@ internal static class ResourceOperations
         }
 
         workspace.EnsureRoleFiles(role);
+        workspace.EnsureSharedRunner();
         var messages = new List<Message>();
         var store = new MessageStore(workspace);
 
@@ -2471,7 +2524,7 @@ internal static class ResourceOperations
                 "system",
                 "roles.changed",
                 "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-                new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, workspace.RoleSourcePath(role)) },
+                new[] { RootRelative(workspace, instructionsPath), RootRelative(workspace, workspace.RunnerSourcePath) },
                 args.WaitMs));
         }
 
@@ -2497,6 +2550,7 @@ internal static class ResourceOperations
             throw CliException.Validation("invalid_role", "Role name is not safe.");
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(workspace, waitMs);
         var dir = workspace.RoleDirectory(role);
         if (!Directory.Exists(dir))
         {
@@ -2504,13 +2558,22 @@ internal static class ResourceOperations
         }
 
         Directory.Delete(dir, recursive: true);
-        return await new MessageStore(workspace).AppendAsync(
+        var store = new MessageStore(workspace);
+        var message = store.NewMessageUnderLock(
             "system",
             "roles.deleted",
             $"! Role \"{role}\" was deleted. Any agent using that role must stop immediately.",
-            new[] { RootRelative(workspace, dir) },
-            waitMs);
+            new[] { RootRelative(workspace, dir) });
+        await Retry.WithinAsync(waitMs, () => store.WriteMessageFileNoRetryAsync(message));
+        return message;
     }
+
+    #endregion
+}
+
+internal static partial class ResourceOperations
+{
+    #region Goals
 
     public static IReadOnlyList<GoalListItem> ListGoals(ChatWorkspace workspace)
     {
@@ -2532,46 +2595,59 @@ internal static class ResourceOperations
 
     public static async Task<Message> AddGoalAsync(ChatWorkspace workspace, string name, string filePath, int waitMs)
     {
-        if (!NameRules.IsValidGoalOrAssetName(name))
-        {
-            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
-        }
-
-        var goalPath = workspace.GoalPath(name);
-        if (File.Exists(goalPath))
-        {
-            throw CliException.Validation("goal_exists", $"Goal '{name}' already exists.");
-        }
-
         var content = ReadTextFile(filePath, "--from");
-        Atomic.WriteText(goalPath, content);
-        var message = MessageStore.NewMessage(
-            "system",
-            "goals.changed",
-            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
-            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, workspace.GoalStatusPath(name)) });
-        new GoalStatusStore(workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
-        await new MessageStore(workspace).AppendPreparedBatchAsync(new[] { message }, waitMs);
-        return message;
+        return await AddGoalContentAsync(workspace, name, content, waitMs);
     }
 
-    public static async Task<Message> UpdateGoalAsync(ChatWorkspace workspace, string name, string filePath, int waitMs)
+    public static async Task<Message> AddGoalContentAsync(ChatWorkspace workspace, string name, string content, int waitMs)
     {
         if (!NameRules.IsValidGoalOrAssetName(name))
         {
             throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(workspace, waitMs);
+        var goalPath = workspace.GoalPath(name);
+        if (File.Exists(goalPath))
+        {
+            throw CliException.Validation("goal_exists", $"Goal '{name}' already exists.");
+        }
+
+        Atomic.WriteText(goalPath, content);
+        var store = new MessageStore(workspace);
+        var message = store.NewMessageUnderLock(
+            "system",
+            "goals.changed",
+            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
+            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, workspace.GoalStatusPath(name)) });
+        new GoalStatusStore(workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
+        await Retry.WithinAsync(waitMs, () => store.WriteMessageFileNoRetryAsync(message));
+        return message;
+    }
+
+    public static async Task<Message> UpdateGoalAsync(ChatWorkspace workspace, string name, string filePath, int waitMs)
+    {
+        var content = ReadTextFile(filePath, "--from");
+        return await UpdateGoalContentAsync(workspace, name, content, waitMs);
+    }
+
+    public static async Task<Message> UpdateGoalContentAsync(ChatWorkspace workspace, string name, string content, int waitMs)
+    {
+        if (!NameRules.IsValidGoalOrAssetName(name))
+        {
+            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+        }
+
+        using var mutationLock = await WorkspaceLock.AcquireAsync(workspace, waitMs);
         var goalPath = workspace.GoalPath(name);
         if (!File.Exists(goalPath))
         {
             throw CliException.Validation("missing_goal", $"Goal '{name}' does not exist.");
         }
 
-        var content = ReadTextFile(filePath, "--from");
         var statusPath = workspace.GoalStatusPath(name);
         var store = new MessageStore(workspace);
-        var message = MessageStore.NewMessage(
+        var message = store.NewMessageUnderLock(
             "system",
             "goals.changed",
             GoalSystemMessages.Edited(name),
@@ -2594,6 +2670,7 @@ internal static class ResourceOperations
             throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(workspace, waitMs);
         var goalPath = workspace.GoalPath(name);
         if (!File.Exists(goalPath))
         {
@@ -2607,13 +2684,22 @@ internal static class ResourceOperations
             File.Delete(statusPath);
         }
 
-        return await new MessageStore(workspace).AppendAsync(
+        var store = new MessageStore(workspace);
+        var message = store.NewMessageUnderLock(
             "system",
             "goals.changed",
             "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
-            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, statusPath) },
-            waitMs);
+            new[] { RootRelative(workspace, goalPath), RootRelative(workspace, statusPath) });
+        await Retry.WithinAsync(waitMs, () => store.WriteMessageFileNoRetryAsync(message));
+        return message;
     }
+
+    #endregion
+}
+
+internal static partial class ResourceOperations
+{
+    #region Assets
 
     public static IReadOnlyList<AssetListItem> ListAssets(ChatWorkspace workspace) =>
         workspace.GetAssetNames()
@@ -2629,6 +2715,7 @@ internal static class ResourceOperations
 
     public static void AddAsset(ChatWorkspace workspace, string name, string filePath)
     {
+        using var mutationLock = WorkspaceLock.Acquire(workspace, 30000);
         var path = ValidateAssetTarget(workspace, name);
         if (File.Exists(path))
         {
@@ -2640,6 +2727,7 @@ internal static class ResourceOperations
 
     public static void UpdateAsset(ChatWorkspace workspace, string name, string filePath)
     {
+        using var mutationLock = WorkspaceLock.Acquire(workspace, 30000);
         var path = ValidateAssetTarget(workspace, name);
         if (!File.Exists(path))
         {
@@ -2651,6 +2739,7 @@ internal static class ResourceOperations
 
     public static void RemoveAsset(ChatWorkspace workspace, string name)
     {
+        using var mutationLock = WorkspaceLock.Acquire(workspace, 30000);
         var path = ValidateAssetTarget(workspace, name);
         if (!File.Exists(path))
         {
@@ -2695,6 +2784,13 @@ internal static class ResourceOperations
             throw;
         }
     }
+
+    #endregion
+}
+
+internal static partial class ResourceOperations
+{
+    #region Shared Helpers
 
     private static string ReadTextFile(string path, string option)
     {
@@ -2745,12 +2841,22 @@ internal static class ResourceOperations
 
     private static string RootRelative(ChatWorkspace workspace, string fullPath) =>
         Path.GetRelativePath(workspace.Root, fullPath).Replace('\\', '/');
+
+    #endregion
 }
+
+#endregion
+
+#region 06 - Archive Import and Export
 
 internal static class ArchiveOperations
 {
     private const string ManifestName = "simpleagentchat-archive.json";
     private const string GoalStatusSuffix = ".status.json";
+    private const int MaxArchiveEntries = 10000;
+    private const long MaxArchiveExpandedBytes = 512L * 1024L * 1024L;
+
+    #region Export
 
     public static ArchiveOperationResult ExportToFile(ChatWorkspace workspace, string zipPath, ArchiveScope scope)
     {
@@ -2765,13 +2871,14 @@ internal static class ArchiveOperations
         var tempPath = Path.Combine(directory, "." + Path.GetFileName(finalPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
         try
         {
+            ArchiveOperationResult streamed;
             using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
             {
-                ExportToStream(workspace, stream, scope);
+                streamed = ExportToStream(workspace, stream, scope);
             }
 
             File.Move(tempPath, finalPath, overwrite: true);
-            return ExportResult(finalPath, scope, CountExportableFiles(workspace, scope));
+            return ExportResult(finalPath, scope, streamed.Counts);
         }
         catch
         {
@@ -2791,6 +2898,7 @@ internal static class ArchiveOperations
             throw CliException.Usage("usage", "At least one archive content type must be selected.");
         }
 
+        using var mutationLock = WorkspaceLock.Acquire(workspace, 30000);
         var counts = new ArchiveCounts(0, 0, 0, 0, 0);
         using var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true);
         WriteManifest(archive, scope);
@@ -2849,6 +2957,10 @@ internal static class ArchiveOperations
         return ExportResult(null, scope, counts);
     }
 
+    #endregion
+
+    #region Import and Rollback
+
     public static ArchiveOperationResult ImportFromFile(ChatWorkspace workspace, string zipPath, ArchiveImportMode mode, ArchiveScope scope)
     {
         if (!scope.Any)
@@ -2864,6 +2976,7 @@ internal static class ArchiveOperations
 
         try
         {
+            using var mutationLock = WorkspaceLock.Acquire(workspace, 30000);
             using var archive = ZipFile.OpenRead(sourcePath);
             var counts = ImportFromArchive(workspace, archive, mode, scope);
             return new ArchiveOperationResult("import", sourcePath, ModeName(mode), scope, counts);
@@ -2876,12 +2989,81 @@ internal static class ArchiveOperations
 
     private static ArchiveCounts ImportFromArchive(ChatWorkspace workspace, ZipArchive archive, ArchiveImportMode mode, ArchiveScope scope)
     {
-        if (mode == ArchiveImportMode.Replace)
+        if (archive.Entries.Count > MaxArchiveEntries)
         {
-            ClearSelectedContent(workspace, scope);
+            throw CliException.Validation("archive_too_large", $"Archive contains more than {MaxArchiveEntries} entries.");
         }
 
+        var stagingRoot = Path.Combine(workspace.ChatDir, ".archive-staging-" + Guid.NewGuid().ToString("N"));
+        var backupRoot = Path.Combine(workspace.ChatDir, ".archive-backup-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stagingRoot);
+        Directory.CreateDirectory(backupRoot);
+        var backupCanBeDeleted = true;
+        try
+        {
+            var counts = StageArchive(workspace, archive, scope, stagingRoot);
+            CopySelectedContent(workspace.ChatDir, backupRoot, scope);
+
+            try
+            {
+                if (mode == ArchiveImportMode.Replace)
+                {
+                    ClearSelectedContent(workspace, scope);
+                }
+
+                CopySelectedContent(stagingRoot, workspace.ChatDir, scope);
+
+                if (scope.Roles)
+                {
+                    foreach (var role in workspace.GetRoleNames())
+                    {
+                        workspace.EnsureRoleFiles(role);
+                    }
+                }
+
+                if (scope.Messages)
+                {
+                    MessageStore.AdvanceCursorHighWaterFromMessagesUnderLock(workspace);
+                }
+
+                HtmlViews.WriteUiShell(workspace);
+                backupCanBeDeleted = true;
+                return counts;
+            }
+            catch (Exception importException)
+            {
+                try
+                {
+                    ClearSelectedContent(workspace, scope);
+                    CopySelectedContent(backupRoot, workspace.ChatDir, scope);
+                    backupCanBeDeleted = true;
+                }
+                catch (Exception rollbackException)
+                {
+                    backupCanBeDeleted = false;
+                    throw new IOException(
+                        $"Archive import failed and rollback also failed. Recovery files remain at '{backupRoot}'.",
+                        new AggregateException(importException, rollbackException));
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            DeleteTemporaryDirectory(stagingRoot);
+            if (backupCanBeDeleted)
+            {
+                DeleteTemporaryDirectory(backupRoot);
+            }
+        }
+    }
+
+    private static ArchiveCounts StageArchive(ChatWorkspace workspace, ZipArchive archive, ArchiveScope scope, string stagingRoot)
+    {
         var counts = new ArchiveCounts(0, 0, 0, 0, 0);
+        var expandedBytes = 0L;
+        var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in archive.Entries.OrderBy(entry => entry.FullName, StringComparer.Ordinal))
         {
             var target = MapImportTarget(workspace, entry, scope);
@@ -2890,20 +3072,69 @@ internal static class ArchiveOperations
                 continue;
             }
 
-            ExtractEntry(entry, target.TargetPath, target.Group);
+            if (entry.Length < 0 || entry.Length > MaxArchiveExpandedBytes - expandedBytes)
+            {
+                throw CliException.Validation("archive_too_large", "Archive expands beyond the 512 MiB import limit.");
+            }
+
+            expandedBytes += entry.Length;
+
+            var relativePath = Path.GetRelativePath(workspace.ChatDir, target.TargetPath);
+            if (!targets.Add(relativePath))
+            {
+                throw CliException.Validation("invalid_archive", $"Archive contains duplicate target '{relativePath.Replace('\\', '/')}'.");
+            }
+
+            var stagedPath = ChatWorkspace.SafeCombine(stagingRoot, relativePath);
+            ExtractEntry(entry, stagedPath, target.Group);
             counts = counts.Add(target.Group);
         }
 
-        if (scope.Roles)
+        return counts;
+    }
+
+    private static void CopySelectedContent(string sourceRoot, string destinationRoot, ArchiveScope scope)
+    {
+        foreach (var directoryName in SelectedDirectoryNames(scope))
         {
-            foreach (var role in workspace.GetRoleNames())
-            {
-                workspace.EnsureRoleFiles(role);
-            }
+            CopyDirectory(Path.Combine(sourceRoot, directoryName), Path.Combine(destinationRoot, directoryName));
+        }
+    }
+
+    private static IEnumerable<string> SelectedDirectoryNames(ArchiveScope scope)
+    {
+        if (scope.Roles) yield return "roles";
+        if (scope.Goals) yield return "goals";
+        if (scope.GoalStatus) yield return "goal_status";
+        if (scope.Messages) yield return "messages";
+        if (scope.Assets) yield return "assets";
+    }
+
+    private static void CopyDirectory(string source, string destination)
+    {
+        if (!Directory.Exists(source))
+        {
+            return;
         }
 
-        HtmlViews.WriteUiShell(workspace);
-        return counts;
+        Directory.CreateDirectory(destination);
+        foreach (var file in Directory.EnumerateFiles(source))
+        {
+            File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), overwrite: true);
+        }
+
+        foreach (var directory in Directory.EnumerateDirectories(source))
+        {
+            CopyDirectory(directory, Path.Combine(destination, Path.GetFileName(directory)));
+        }
+    }
+
+    private static void DeleteTemporaryDirectory(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, recursive: true);
+        }
     }
 
     private static void ClearSelectedContent(ChatWorkspace workspace, ArchiveScope scope)
@@ -3038,6 +3269,10 @@ internal static class ArchiveOperations
         }
     }
 
+    #endregion
+
+    #region Archive Helpers
+
     private static void WriteManifest(ZipArchive archive, ArchiveScope scope)
     {
         var entry = archive.CreateEntry(ManifestName, CompressionLevel.Optimal);
@@ -3066,61 +3301,25 @@ internal static class ArchiveOperations
         return counts.Add(group);
     }
 
-    private static ArchiveCounts CountExportableFiles(ChatWorkspace workspace, ArchiveScope scope)
-    {
-        var counts = new ArchiveCounts(0, 0, 0, 0, 0);
-        if (scope.Roles)
-        {
-            foreach (var role in workspace.GetRoleNames())
-            {
-                var dir = workspace.RoleDirectory(role);
-                if (File.Exists(Path.Combine(dir, "instructions.md"))) counts = counts.Add(ArchiveGroup.Roles);
-                if (File.Exists(Path.Combine(dir, "role_memory.md"))) counts = counts.Add(ArchiveGroup.Roles);
-            }
-        }
-
-        if (scope.Goals)
-        {
-            foreach (var _ in workspace.GetGoalNames()) counts = counts.Add(ArchiveGroup.Goals);
-        }
-
-        if (scope.GoalStatus && Directory.Exists(workspace.GoalStatusDir))
-        {
-            foreach (var file in Directory.EnumerateFiles(workspace.GoalStatusDir, "*" + GoalStatusSuffix))
-            {
-                var name = Path.GetFileName(file);
-                if (NameRules.IsValidGoalOrAssetName(name[..^GoalStatusSuffix.Length])) counts = counts.Add(ArchiveGroup.GoalStatus);
-            }
-        }
-
-        if (scope.Messages && Directory.Exists(workspace.MessagesDir))
-        {
-            foreach (var file in Directory.EnumerateFiles(workspace.MessagesDir, "*.json"))
-            {
-                if (NameRules.IsValidMessageId(Path.GetFileNameWithoutExtension(file))) counts = counts.Add(ArchiveGroup.Messages);
-            }
-        }
-
-        if (scope.Assets)
-        {
-            foreach (var _ in workspace.GetAssetNames()) counts = counts.Add(ArchiveGroup.Assets);
-        }
-
-        return counts;
-    }
-
     private static ArchiveOperationResult ExportResult(string? path, ArchiveScope scope, ArchiveCounts counts) =>
         new("export", path, null, scope, counts);
 
     private static string ModeName(ArchiveImportMode mode) => mode == ArchiveImportMode.Replace ? "replace" : "merge";
 
     private sealed record ArchiveImportTarget(ArchiveGroup Group, string TargetPath);
+
+    #endregion
 }
 
-internal sealed class LocalServer
+#endregion
+
+#region 07 - Local HTTP Server
+
+internal sealed partial class LocalServer
 {
     private const int DefaultStartPort = 8765;
     private const int DefaultEndPort = 8799;
+    private const long MaxArchiveUploadBytes = 128L * 1024L * 1024L;
     private readonly ChatWorkspace _workspace;
     private readonly int? _requestedPort;
     private readonly bool _noOpen;
@@ -3128,6 +3327,8 @@ internal sealed class LocalServer
     private readonly List<ServerEventClient> _eventClients = new();
     private int _port;
     private int _eventSequence;
+
+    #region Lifecycle, Watchers, and Routing
 
     public LocalServer(ChatWorkspace workspace, int? requestedPort, bool noOpen)
     {
@@ -3388,6 +3589,13 @@ internal sealed class LocalServer
         throw new ApiException(404, "not_found", "API endpoint not found.");
     }
 
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region Live Events and Messages
+
     private async Task StreamEventsAsync(HttpListenerContext context)
     {
         context.Response.StatusCode = 200;
@@ -3509,6 +3717,13 @@ internal sealed class LocalServer
         message.ChangedPaths
     };
 
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region Role Reads and Routing
+
     private async Task RouteRolesAsync(HttpListenerContext context, string method, string[] segments)
     {
         if (segments.Length == 2 && method == "GET")
@@ -3597,6 +3812,13 @@ internal sealed class LocalServer
         };
     }
 
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region Transcript and Archive Endpoints
+
     private async Task ExportHtmlAsync(HttpListenerContext context)
     {
         HtmlViews.RegenerateChat(_workspace);
@@ -3623,23 +3845,54 @@ internal sealed class LocalServer
     private async Task ExportArchiveAsync(HttpListenerContext context)
     {
         var scope = ArchiveScopeFromQuery(context.Request.QueryString);
-        using var stream = new MemoryStream();
-        ArchiveOperations.ExportToStream(_workspace, stream, scope);
-        var bytes = stream.ToArray();
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = "application/zip";
+        context.Response.SendChunked = true;
         context.Response.Headers["Content-Disposition"] = "attachment; filename=\"simpleagentchat-archive.zip\"";
-        await WriteBytesAsync(context, 200, "application/zip", bytes);
+        ArchiveOperations.ExportToStream(_workspace, context.Response.OutputStream, scope);
+        await context.Response.OutputStream.FlushAsync();
     }
 
     private async Task ImportArchiveAsync(HttpListenerContext context)
     {
         var scope = ArchiveScopeFromQuery(context.Request.QueryString);
         var mode = ArchiveImportModeFromQuery(context.Request.QueryString);
+        if (context.Request.ContentLength64 > MaxArchiveUploadBytes)
+        {
+            throw new ApiException(413, "archive_too_large", "Archive upload exceeds the 128 MiB compressed-size limit.");
+        }
+
         var tempPath = Path.Combine(Path.GetTempPath(), "simpleagentchat-import-" + Guid.NewGuid().ToString("N") + ".zip");
         try
         {
             await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
-                await context.Request.InputStream.CopyToAsync(output);
+                var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+                long total = 0;
+                try
+                {
+                    while (true)
+                    {
+                        var read = await context.Request.InputStream.ReadAsync(buffer.AsMemory(0, buffer.Length));
+                        if (read == 0)
+                        {
+                            break;
+                        }
+
+                        total += read;
+                        if (total > MaxArchiveUploadBytes)
+                        {
+                            throw new ApiException(413, "archive_too_large", "Archive upload exceeds the 128 MiB compressed-size limit.");
+                        }
+
+                        await output.WriteAsync(buffer.AsMemory(0, read));
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+
                 await output.FlushAsync();
             }
 
@@ -3664,6 +3917,13 @@ internal sealed class LocalServer
         if (scope.Assets) BroadcastEvent("assets");
     }
 
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region Role Mutations
+
     private async Task PutRoleAsync(HttpListenerContext context, string role)
     {
         using var document = await ReadJsonDocumentAsync(context.Request);
@@ -3687,14 +3947,14 @@ internal sealed class LocalServer
         using var document = await ReadJsonDocumentAsync(context.Request);
         var markdown = GetString(document, "markdown") ?? "";
         _workspace.EnsureRoleFiles(role);
+        _workspace.EnsureSharedRunner();
         var path = Path.Combine(_workspace.RoleDirectory(role), "instructions.md");
-        var sourcePath = _workspace.RoleSourcePath(role);
         Atomic.WriteText(path, markdown);
         var message = await new MessageStore(_workspace).AppendAsync(
             "system",
             "roles.changed",
             "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { RootRelative(path), RootRelative(sourcePath) },
+            new[] { RootRelative(path), RootRelative(_workspace.RunnerSourcePath) },
             30000);
         await WriteJsonAsync(context, 200, new { role, message });
     }
@@ -3744,6 +4004,7 @@ internal sealed class LocalServer
             return;
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, 30000);
         var oldDir = _workspace.RoleDirectory(role);
         var newDir = _workspace.RoleDirectory(newRole);
         if (!Directory.Exists(oldDir))
@@ -3759,12 +4020,13 @@ internal sealed class LocalServer
         Directory.Move(oldDir, newDir);
         _workspace.EnsureRoleFiles(newRole);
         UpdateGoalStatusRoleName(role, newRole);
-        var message = await new MessageStore(_workspace).AppendAsync(
+        var store = new MessageStore(_workspace);
+        var message = store.NewMessageUnderLock(
             "system",
             "roles.changed",
             "Roles changed. Agents must re-read `.simpleagentchat/roles` before continuing.",
-            new[] { RootRelative(oldDir), RootRelative(newDir) },
-            30000);
+            new[] { RootRelative(oldDir), RootRelative(newDir) });
+        await Retry.WithinAsync(30000, () => store.WriteMessageFileNoRetryAsync(message));
         await WriteJsonAsync(context, 200, new { role = newRole, renamed = true, message });
     }
 
@@ -3797,6 +4059,7 @@ internal sealed class LocalServer
             throw CliException.Validation("invalid_role", "Role name is not safe.");
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, 30000);
         var dir = _workspace.RoleDirectory(role);
         if (!Directory.Exists(dir))
         {
@@ -3804,14 +4067,22 @@ internal sealed class LocalServer
         }
 
         Directory.Delete(dir, recursive: true);
-        var message = await new MessageStore(_workspace).AppendAsync(
+        var store = new MessageStore(_workspace);
+        var message = store.NewMessageUnderLock(
             "system",
             "roles.deleted",
             $"! Role \"{role}\" was deleted. Any agent using that role must stop immediately.",
-            new[] { RootRelative(dir) },
-            30000);
+            new[] { RootRelative(dir) });
+        await Retry.WithinAsync(30000, () => store.WriteMessageFileNoRetryAsync(message));
         await WriteJsonAsync(context, 200, new { role, deleted = true, message });
     }
+
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region Goal Endpoints
 
     private async Task RouteGoalsAsync(HttpListenerContext context, string method, string[] segments)
     {
@@ -3887,29 +4158,9 @@ internal sealed class LocalServer
 
     private async Task PutGoalAsync(HttpListenerContext context, string name)
     {
-        if (!NameRules.IsValidGoalOrAssetName(name))
-        {
-            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
-        }
-
         using var document = await ReadJsonDocumentAsync(context.Request);
         var content = GetString(document, "content") ?? "";
-        var goalPath = _workspace.GoalPath(name);
-        var statusPath = _workspace.GoalStatusPath(name);
-        var store = new MessageStore(_workspace);
-        var message = MessageStore.NewMessage(
-            "system",
-            "goals.changed",
-            GoalSystemMessages.Edited(name),
-            new[] { RootRelative(goalPath), RootRelative(statusPath) });
-
-        await Retry.WithinAsync(30000, async () =>
-        {
-            Atomic.WriteText(goalPath, content);
-            new GoalStatusStore(_workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
-            await store.WriteMessageFileNoRetryAsync(message);
-        });
-
+        var message = await ResourceOperations.UpdateGoalContentAsync(_workspace, name, content, 30000);
         await WriteJsonAsync(context, 200, new { name, message });
     }
 
@@ -3917,27 +4168,17 @@ internal sealed class LocalServer
     {
         using var document = await ReadJsonDocumentAsync(context.Request);
         var name = GetString(document, "name") ?? "";
-        if (!NameRules.IsValidGoalOrAssetName(name))
-        {
-            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
-        }
-
-        var goalPath = _workspace.GoalPath(name);
-        if (File.Exists(goalPath))
-        {
-            throw new ApiException(409, "goal_exists", $"Goal '{name}' already exists.");
-        }
-
         var content = GetString(document, "content") ?? "";
-        Atomic.WriteText(goalPath, content);
-        var store = new MessageStore(_workspace);
-        var message = MessageStore.NewMessage(
-            "system",
-            "goals.changed",
-            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
-            new[] { RootRelative(goalPath), RootRelative(_workspace.GoalStatusPath(name)) });
-        new GoalStatusStore(_workspace).ResetGoalForCurrentRoles(name, message.TimestampUtc, message.Id);
-        await store.AppendPreparedBatchAsync(new[] { message }, 30000);
+        Message message;
+        try
+        {
+            message = await ResourceOperations.AddGoalContentAsync(_workspace, name, content, 30000);
+        }
+        catch (CliException ex) when (ex.Code == "goal_exists")
+        {
+            throw new ApiException(409, ex.Code, ex.Message);
+        }
+
         await WriteJsonAsync(context, 200, new { name, message });
     }
 
@@ -3961,6 +4202,7 @@ internal sealed class LocalServer
             return;
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, 30000);
         var oldGoalPath = _workspace.GoalPath(name);
         var newGoalPath = _workspace.GoalPath(newName);
         if (!File.Exists(oldGoalPath))
@@ -3987,43 +4229,37 @@ internal sealed class LocalServer
             RewriteGoalStatusName(newStatusPath, newName);
         }
 
-        var message = await new MessageStore(_workspace).AppendAsync(
+        var store = new MessageStore(_workspace);
+        var message = store.NewMessageUnderLock(
             "system",
             "goals.changed",
             "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
-            new[] { RootRelative(oldGoalPath), RootRelative(newGoalPath), RootRelative(oldStatusPath), RootRelative(newStatusPath) },
-            30000);
+            new[] { RootRelative(oldGoalPath), RootRelative(newGoalPath), RootRelative(oldStatusPath), RootRelative(newStatusPath) });
+        await Retry.WithinAsync(30000, () => store.WriteMessageFileNoRetryAsync(message));
         await WriteJsonAsync(context, 200, new { name = newName, renamed = true, message });
     }
 
     private async Task DeleteGoalAsync(HttpListenerContext context, string name)
     {
-        if (!NameRules.IsValidGoalOrAssetName(name))
+        Message message;
+        try
         {
-            throw CliException.Validation("invalid_goal", "Goal file name is not safe.");
+            message = await ResourceOperations.RemoveGoalAsync(_workspace, name, 30000);
+        }
+        catch (CliException ex) when (ex.Code == "missing_goal")
+        {
+            throw new ApiException(404, ex.Code, ex.Message);
         }
 
-        var goalPath = _workspace.GoalPath(name);
-        if (!File.Exists(goalPath))
-        {
-            throw new ApiException(404, "missing_goal", $"Goal '{name}' does not exist.");
-        }
-
-        var statusPath = _workspace.GoalStatusPath(name);
-        File.Delete(goalPath);
-        if (File.Exists(statusPath))
-        {
-            File.Delete(statusPath);
-        }
-
-        var message = await new MessageStore(_workspace).AppendAsync(
-            "system",
-            "goals.changed",
-            "Goals changed. Agents must re-read `.simpleagentchat/goals` before continuing.",
-            new[] { RootRelative(goalPath), RootRelative(statusPath) },
-            30000);
         await WriteJsonAsync(context, 200, new { name, deleted = true, message });
     }
+
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region Asset Endpoints
 
     private async Task RouteAssetsApiAsync(HttpListenerContext context, string method, string[] segments)
     {
@@ -4070,6 +4306,7 @@ internal sealed class LocalServer
             throw new ApiException(413, "asset_too_large", "Asset upload exceeds the 25 MiB limit.");
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, 30000);
         var path = _workspace.AssetPath(name);
         var tempPath = Path.Combine(_workspace.AssetsDir, "." + name + "." + Guid.NewGuid().ToString("N") + ".tmp");
         long total = 0;
@@ -4123,6 +4360,7 @@ internal sealed class LocalServer
             throw CliException.Validation("invalid_asset", "Asset file name is not safe.");
         }
 
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, 30000);
         var path = _workspace.AssetPath(name);
         if (!File.Exists(path))
         {
@@ -4155,6 +4393,13 @@ internal sealed class LocalServer
         var (contentType, attachment) = AssetContentType(name);
         await SendFileAsync(context, path, contentType, attachment);
     }
+
+    #endregion
+}
+
+internal sealed partial class LocalServer
+{
+    #region HTTP and Metadata Helpers
 
     private static string[] GetSegments(HttpListenerRequest request)
     {
@@ -4387,6 +4632,8 @@ internal sealed class LocalServer
         return roles.Count > 0 &&
                roles.All(role => document.Roles.TryGetValue(role, out var entry) && entry.Status == "done");
     }
+
+    #endregion
 }
 
 internal sealed class ApiException : Exception
@@ -4462,11 +4709,15 @@ internal sealed class DisposableWatchers : IDisposable
     }
 }
 
+#endregion
+
+#region 08 - Message Storage and Agent-Facing Output
+
 internal sealed class MessageStore
 {
     private readonly ChatWorkspace _workspace;
-    private static readonly object ClockLock = new();
-    private static DateTimeOffset _lastTimestamp = DateTimeOffset.MinValue;
+    private const string CursorHighWaterFileName = "message-cursor.txt";
+    private const string CursorTimestampFormat = "yyyyMMdd'T'HHmmss.fffffff'Z'";
 
     public MessageStore(ChatWorkspace workspace)
     {
@@ -4475,12 +4726,13 @@ internal sealed class MessageStore
 
     public async Task<Message> AppendAsync(string role, string kind, string markdown, IReadOnlyList<string> changedPaths, int waitMs)
     {
-        var message = NewMessage(role, kind, markdown, changedPaths);
-        await AppendPreparedBatchAsync(new[] { message }, waitMs);
+        using var mutationLock = await WorkspaceLock.AcquireAsync(_workspace, waitMs);
+        var message = NewMessageUnderLock(role, kind, markdown, changedPaths);
+        await Retry.WithinAsync(waitMs, () => WriteMessageFileNoRetryAsync(message));
         return message;
     }
 
-    public static Message NewMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
+    internal Message NewMessageUnderLock(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
     {
         if (!NameRules.IsValidMessageRole(role))
         {
@@ -4490,23 +4742,23 @@ internal sealed class MessageStore
         return CreateMessage(role, kind, markdown, changedPaths);
     }
 
-    public Task AppendPreparedBatchAsync(IReadOnlyList<Message> messages, int waitMs)
-    {
-        return Retry.WithinAsync(waitMs, async () =>
-        {
-            foreach (var message in messages)
-            {
-                await WriteMessageFileNoRetryAsync(message);
-            }
-        });
-    }
-
     internal async Task WriteMessageFileNoRetryAsync(Message message)
     {
         Directory.CreateDirectory(_workspace.MessagesDir);
         var finalPath = Path.Combine(_workspace.MessagesDir, message.Id + ".json");
+        var serialized = Json.Text(message) + "\n";
+        if (File.Exists(finalPath))
+        {
+            if (string.Equals(await File.ReadAllTextAsync(finalPath, Encoding.UTF8), serialized, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            throw new IOException($"Message id collision for '{message.Id}'.");
+        }
+
         var tempPath = Path.Combine(_workspace.MessagesDir, "." + message.Id + "." + Guid.NewGuid().ToString("N") + ".tmp");
-        await Atomic.WriteTextAsync(tempPath, Json.Text(message) + "\n");
+        await Atomic.WriteTextAsync(tempPath, serialized);
         try
         {
             File.Move(tempPath, finalPath, overwrite: false);
@@ -4525,14 +4777,25 @@ internal sealed class MessageStore
             throw CliException.Validation("invalid_cursor", "Cursor is not a valid simpleagentchat message id.");
         }
 
+        Directory.CreateDirectory(_workspace.MessagesDir);
+        using var signal = new SemaphoreSlim(0, 1);
+        using var watcher = new FileSystemWatcher(_workspace.MessagesDir, "*.json")
+        {
+            NotifyFilter = NotifyFilters.FileName,
+            EnableRaisingEvents = waitMs > 0
+        };
+        FileSystemEventHandler changed = (_, _) => Signal();
+        RenamedEventHandler renamed = (_, _) => Signal();
+        ErrorEventHandler error = (_, _) => Signal();
+        watcher.Created += changed;
+        watcher.Renamed += renamed;
+        watcher.Error += error;
+
         var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
         while (true)
         {
-            var allMessages = ReadAllMessages();
-            var newest = allMessages.Count == 0 ? null : allMessages[^1].Id;
-            var newer = cursor is null
-                ? allMessages
-                : allMessages.Where(m => string.CompareOrdinal(m.Id, cursor) > 0).ToList();
+            var newer = ReadMessagesAfter(cursor);
+            var newest = newer.Count == 0 ? cursor : newer[^1].Id;
             var filtered = includeSystem ? newer : newer.Where(m => m.Role != "system").ToList();
 
             if (filtered.Count > 0 || (newer.Count > 0 && filtered.Count == 0) || waitMs == 0 || DateTime.UtcNow >= deadline)
@@ -4541,11 +4804,33 @@ internal sealed class MessageStore
                 return new FetchResponse(newest, timedOut, filtered);
             }
 
-            await Task.Delay(Math.Min(200, Math.Max(10, waitMs)));
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                continue;
+            }
+
+            await signal.WaitAsync(remaining);
+        }
+
+        void Signal()
+        {
+            if (signal.CurrentCount == 0)
+            {
+                try
+                {
+                    signal.Release();
+                }
+                catch (SemaphoreFullException)
+                {
+                }
+            }
         }
     }
 
-    public List<Message> ReadAllMessages()
+    public List<Message> ReadAllMessages() => ReadMessagesAfter(cursor: null);
+
+    private List<Message> ReadMessagesAfter(string? cursor)
     {
         if (!Directory.Exists(_workspace.MessagesDir))
         {
@@ -4556,7 +4841,7 @@ internal sealed class MessageStore
         foreach (var file in Directory.EnumerateFiles(_workspace.MessagesDir, "*.json").Order(StringComparer.Ordinal))
         {
             var id = Path.GetFileNameWithoutExtension(file);
-            if (!NameRules.IsValidMessageId(id))
+            if (!NameRules.IsValidMessageId(id) || (cursor is not null && string.CompareOrdinal(id, cursor) <= 0))
             {
                 continue;
             }
@@ -4583,28 +4868,104 @@ internal sealed class MessageStore
         return messages;
     }
 
-    private static Message CreateMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
+    internal static void AdvanceCursorHighWaterFromMessagesUnderLock(ChatWorkspace workspace)
+    {
+        var store = new MessageStore(workspace);
+        var latestMessageTimestamp = store.FindLatestMessageTimestamp();
+        if (!latestMessageTimestamp.HasValue)
+        {
+            return;
+        }
+
+        var current = store.ReadCursorHighWater(scanMessagesWhenMissing: false);
+        if (!current.HasValue || latestMessageTimestamp.Value > current.Value)
+        {
+            store.WriteCursorHighWater(latestMessageTimestamp.Value);
+        }
+    }
+
+    private Message CreateMessage(string role, string kind, string markdown, IReadOnlyList<string> changedPaths)
     {
         var timestamp = NextTimestamp();
         var random = Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant();
-        var id = timestamp.ToString("yyyyMMdd'T'HHmmss.fffffff'Z'", CultureInfo.InvariantCulture) + "-" + role + "-" + random;
+        var id = timestamp.ToString(CursorTimestampFormat, CultureInfo.InvariantCulture) + "-" + role + "-" + random;
         return new Message(id, Time.RoundTrip(timestamp), role, kind, markdown, changedPaths.ToArray());
     }
 
-    private static DateTimeOffset NextTimestamp()
+    private DateTimeOffset NextTimestamp()
     {
-        lock (ClockLock)
+        var now = DateTimeOffset.UtcNow;
+        var highWater = ReadCursorHighWater(scanMessagesWhenMissing: true);
+        if (highWater.HasValue && now <= highWater.Value)
         {
-            var now = DateTimeOffset.UtcNow;
-            if (now <= _lastTimestamp)
+            now = highWater.Value.AddTicks(1);
+        }
+
+        WriteCursorHighWater(now);
+        return now;
+    }
+
+    private DateTimeOffset? ReadCursorHighWater(bool scanMessagesWhenMissing)
+    {
+        var path = CursorHighWaterPath();
+        if (File.Exists(path) &&
+            DateTimeOffset.TryParseExact(
+                File.ReadAllText(path, Encoding.UTF8).Trim(),
+                Time.RoundTripFormat,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var persisted))
+        {
+            return persisted;
+        }
+
+        return scanMessagesWhenMissing ? FindLatestMessageTimestamp() : null;
+    }
+
+    private DateTimeOffset? FindLatestMessageTimestamp()
+    {
+        if (!Directory.Exists(_workspace.MessagesDir))
+        {
+            return null;
+        }
+
+        DateTimeOffset? latest = null;
+        foreach (var path in Directory.EnumerateFiles(_workspace.MessagesDir, "*.json"))
+        {
+            var id = Path.GetFileNameWithoutExtension(path);
+            if (!NameRules.IsValidMessageId(id))
             {
-                now = _lastTimestamp.AddTicks(1);
+                continue;
             }
 
-            _lastTimestamp = now;
-            return now;
+            var separator = id.IndexOf('-');
+            if (separator <= 0 ||
+                !DateTimeOffset.TryParseExact(
+                    id[..separator],
+                    CursorTimestampFormat,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out var timestamp))
+            {
+                continue;
+            }
+
+            if (!latest.HasValue || timestamp > latest.Value)
+            {
+                latest = timestamp;
+            }
         }
+
+        return latest;
     }
+
+    private void WriteCursorHighWater(DateTimeOffset timestamp)
+    {
+        Atomic.WriteText(CursorHighWaterPath(), Time.RoundTrip(timestamp) + "\n");
+    }
+
+    private string CursorHighWaterPath() =>
+        Path.Combine(_workspace.ChatDir, ".locks", CursorHighWaterFileName);
 }
 
 internal sealed record Message(
@@ -4620,8 +4981,41 @@ internal sealed record FetchResponse(
     bool TimedOut,
     IReadOnlyList<Message> Messages);
 
+internal sealed record JoinGoal(string Name, string Content, GoalStatusReport Status);
+
+internal sealed record JoinResponse(
+    string Role,
+    string Instructions,
+    string Memory,
+    IReadOnlyList<JoinGoal> Goals,
+    bool Started,
+    string? NextCursor,
+    IReadOnlyList<Message> Messages);
+
 internal static class PlainText
 {
+    public static void WriteJoin(JoinResponse response)
+    {
+        Console.Out.WriteLine($"role: {response.Role}");
+        Console.Out.WriteLine($"started: {response.Started.ToString().ToLowerInvariant()}");
+        Console.Out.WriteLine($"nextCursor: {response.NextCursor ?? "null"}");
+        Console.Out.WriteLine("instructions:");
+        Console.Out.WriteLine(response.Instructions);
+        Console.Out.WriteLine("memory:");
+        Console.Out.WriteLine(response.Memory);
+        Console.Out.WriteLine($"goalCount: {response.Goals.Count}");
+        foreach (var goal in response.Goals)
+        {
+            Console.Out.WriteLine();
+            Console.Out.WriteLine($"--- goal {goal.Name}");
+            Console.Out.WriteLine(goal.Content);
+            WriteGoalStatus(goal.Status);
+            Console.Out.WriteLine("--- end goal");
+        }
+
+        WriteFetch(new FetchResponse(response.NextCursor, TimedOut: false, response.Messages));
+    }
+
     public static void WriteFetch(FetchResponse response)
     {
         Console.Out.WriteLine($"nextCursor: {response.NextCursor ?? "null"}");
@@ -4683,13 +5077,13 @@ internal static class PlainText
 
 internal static class RolePrompts
 {
-    public static string RunnerPath(string role) => $".simpleagentchat/roles/{role}/runner/simpleagentchat-{role}.dll";
+    public const string RunnerPath = ".simpleagentchat/runner/simpleagentchat-runner.dll";
 
-    public static string RunnerCommand(string role) => $"dotnet {RunnerPath(role)}";
+    public static string RunnerCommand() => $"dotnet {RunnerPath}";
 
     public static string BuildJoinPrompt(ChatWorkspace workspace, string role)
     {
-        var runnerCommand = RunnerCommand(role);
+        var runnerCommand = RunnerCommand();
         var roleDir = $".simpleagentchat/roles/{role}";
         var powerShellLocation = $"Set-Location -LiteralPath '{PowerShellSingleQuoted(workspace.Root)}'";
 
@@ -4701,31 +5095,34 @@ internal static class RolePrompts
             $"PowerShell setup: {powerShellLocation}",
             $"Assigned role: {role}",
             "",
-            "Use this role-local runner for all chat commands:",
+            "Use this shared prebuilt runner for all chat commands:",
             $"`{runnerCommand}`",
             "",
             "Do not run the root `simpleagentchat.cs` file for chat commands.",
             "",
             "Before you speak or change files, get acquainted with the room and repo:",
-            "1. Read `.simpleagentchat/HOW_TO_CHAT.md` and follow it, including whether a human `Start` is already present or still required.",
-            "2. Read the current overall goals in `.simpleagentchat/goals/`.",
-            $"3. Read your assigned role files: `{roleDir}/instructions.md` and `{roleDir}/role_memory.md`.",
-            $"4. Fetch prior chat history with `{runnerCommand} fetch --wait-ms 0 --json`.",
-            $"5. Review prior non-system messages from `{role}` and inspect the repository context enough to understand the requested work.",
+            $"1. Run `{runnerCommand} join {role} --json` to load your instructions, memory, goals, statuses, prior chat, Start state, and next cursor in one response.",
+            "2. Read `.simpleagentchat/HOW_TO_CHAT.md` and follow it.",
+            $"3. If needed, inspect the source files directly under `{roleDir}` and `.simpleagentchat/goals/`.",
+            $"4. Review prior non-system messages from `{role}` and inspect the repository context enough to understand the requested work.",
             "",
             $"Then join as `{role}`:",
             $"- If your current participation is not already clear from the fetched chat, announce yourself briefly with `{runnerCommand} say {role} \"...\"`.",
-            "- Start the simpleagentchat protocol: do the role's work, and keep polling/fetching for other messages in the meantime.",
+            "- Start the simpleagentchat protocol: do the role's work, and poll/fetch for other messages at meaningful checkpoints.",
             "- Track the latest `nextCursor`. Before each meaningful work step, and at least every 2-3 minutes while doing actual work, fetch from it and obey human, system, and relevant role messages.",
-            $"- If no messages are available, long-poll with `{runnerCommand} fetch <nextCursor> --wait-ms {FetchArgs.DefaultWaitMs} --json`. If a long poll returns no messages or times out, continue polling.",
+            $"- While actively working or monitoring, long-poll with `{runnerCommand} fetch <nextCursor> --wait-ms {FetchArgs.DefaultWaitMs} --json`.",
             "- Announce when you complete a large or important piece of work, find anything of interest, are about to make a big change, or want the opinion of other participants.",
-            "- Do not stop just because current goals are done; keep listening until a human or system message explicitly tells your role to stop.",
+            "- After your handoff, perform one final fetch. You may then leave unless a human explicitly asked you to keep monitoring.",
             $"- When your role finishes its part, post a concise handoff/conclusion. Use `{runnerCommand} goal done {role} <goal_file_name>` only after checking the goal from your role's responsibility."
         }) + "\n";
     }
 
     private static string PowerShellSingleQuoted(string value) => value.Replace("'", "''", StringComparison.Ordinal);
 }
+
+#endregion
+
+#region 09 - HTML, Browser UI, and Markdown Rendering
 
 internal static class HtmlViews
 {
@@ -4915,6 +5312,7 @@ button:disabled{cursor:not-allowed;opacity:.55}
 </section>
 </main>
 <script>
+// 01 - Shared state and API helpers
 const $=id=>document.getElementById(id);
 let chatCursor=null;
 let chatMessageIds=new Set();
@@ -4925,6 +5323,7 @@ function setStatus(text){$('status').textContent=text}
 async function api(path, options){const r=await fetch(path, options); if(!r.ok){throw new Error(await r.text())} return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
 function text(value){return value==null?'':String(value)}
 function roleClass(role){return text(role).replace(/[^a-zA-Z0-9_-]/g,'-')}
+// 02 - Chat rendering and actions
 function chatScrollState(){const log=$('chatLog'); const remaining=log.scrollHeight-log.scrollTop-log.clientHeight; return {top:log.scrollTop,atEnd:remaining<24 || log.scrollHeight<=log.clientHeight+1}}
 function restoreChatScroll(state){const log=$('chatLog'); if(state.atEnd){log.scrollTop=log.scrollHeight}else{log.scrollTop=Math.min(state.top,Math.max(0,log.scrollHeight-log.clientHeight))}}
 function renderMessage(message){const article=document.createElement('article'); article.className='message '+roleClass(message.role); const meta=document.createElement('div'); meta.className='message-meta'; for(const value of [message.role,message.timestampUtc,message.kind,message.id]){const span=document.createElement('span'); span.textContent=text(value); if(value===message.role)span.className='message-role'; meta.appendChild(span)} const body=document.createElement('div'); body.className='markdown'; body.innerHTML=text(message.html); article.appendChild(meta); article.appendChild(body); return article}
@@ -4934,9 +5333,11 @@ async function loadNewMessages(){const state=chatScrollState(); const query='/ap
 async function refreshAll(){await Promise.all([loadRoles(),loadGoals(),loadAssets(),refreshChat()]); setStatus('Refreshed')}
 async function sendMessage(){const state=chatScrollState(); const data=await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({markdown:$('message').value,critical:$('critical').checked})}); $('message').value=''; $('critical').checked=false; renderChat([data.message],false); chatCursor=data.nextCursor||data.message?.id||chatCursor; restoreChatScroll(state); setStatus('Sent')}
 async function exportChat(){const data=await api('/api/export-html',{method:'POST'}); setStatus('Exported '+text(data.path))}
+// 03 - Tabs and form helpers
 function showTab(name){for(const n of ['roles','goals','assets','archive']){$(n+'Panel').hidden=n!==name; $('tab'+n[0].toUpperCase()+n.slice(1)).setAttribute('aria-selected',n===name)}}
 function replaceOptions(select, values){select.textContent=''; for(const value of values){const option=document.createElement('option'); option.value=value; option.textContent=value; select.appendChild(option)}}
 function requiredValue(id){const element=$(id); const value=element.value.trim(); if(!value){element.reportValidity?.(); element.focus(); return null} return value}
+// 04 - Role management
 function roleDraft(){return {role:$('roleName').value.trim(),instructions:$('roleInstructions').value,memory:$('roleMemory').value}}
 function hasSelectedRole(){return roleBaseline.role&&roleNames.has(roleBaseline.role)}
 function roleContentChanged(){const draft=roleDraft(); return draft.instructions!==roleBaseline.instructions||draft.memory!==roleBaseline.memory}
@@ -4951,6 +5352,7 @@ async function renameRole(){const role=roleBaseline.role; const next=requiredVal
 async function saveRole(){const draft=roleDraft(); const role=roleBaseline.role; if(!role)return; await api('/api/roles/'+encodeURIComponent(role),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({instructions:draft.instructions,memory:draft.memory})}); await loadRoles(role); await loadNewMessages(); setStatus('Saved '+role)}
 function clearRoleFields(){if(!confirm('Clear role fields?'))return; currentRolePrompt=''; $('roleSelect').selectedIndex=-1; setRoleDraft('','',''); $('roleName').focus()}
 async function deleteRole(){const role=$('roleSelect').value; if(role){await api('/api/roles/'+encodeURIComponent(role),{method:'DELETE'}); await refreshAll()}}
+// 05 - Goal management and approval status
 let goalsCache=[];
 function statusText(status){return status==='done'?'Done':'Incomplete'}
 function statusClass(status){return status==='done'?'done':'undone'}
@@ -4961,14 +5363,17 @@ async function addGoal(){const name=requiredValue('goalName'); if(!name)return; 
 async function renameGoal(){const name=$('goalSelect').value; const next=requiredValue('goalName'); if(!name||!next)return; await api('/api/goals/'+encodeURIComponent(name)+'/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:next})}); await loadGoals(next); await loadNewMessages()}
 async function saveGoal(){const name=$('goalSelect').value; if(!name)return; await api('/api/goals/'+encodeURIComponent(name),{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:$('goalContent').value})}); await loadGoals(name); await loadNewMessages()}
 async function deleteGoal(){const name=$('goalSelect').value; if(name){await api('/api/goals/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}}
+// 06 - Assets
 async function loadAssets(){const data=await api('/api/assets'); $('assetList').innerHTML=data.assets.map(a=>`<div class="item"><a href="/assets/${encodeURIComponent(a.name)}" target="_blank">${a.name}</a><span class="muted">${a.length} bytes</span><button class="danger" onclick="deleteAsset('${a.name}')">Delete</button></div>`).join('')}
 async function uploadAsset(){const file=$('assetFile').files[0]; const name=$('assetName').value || file?.name; if(!file||!name)return; await fetch('/api/assets/'+encodeURIComponent(name),{method:'PUT',body:file}).then(async r=>{if(!r.ok)throw new Error(await r.text())}); await refreshAll()}
 async function deleteAsset(name){await api('/api/assets/'+encodeURIComponent(name),{method:'DELETE'}); await refreshAll()}
+// 07 - Archive import and export
 function archiveOptions(){return [{id:'archiveRoles',param:'roles',name:'roles'},{id:'archiveGoals',param:'goals',name:'goals'},{id:'archiveGoalStatus',param:'goalStatus',name:'goal status'},{id:'archiveMessages',param:'messages',name:'messages'},{id:'archiveAssets',param:'assets',name:'assets'}]}
 function archiveScopeParams(){const params=new URLSearchParams(); for(const item of archiveOptions()){params.set(item.param,$(item.id).checked?'true':'false')} return params}
 function archiveScopeNames(){return archiveOptions().filter(item=>$(item.id).checked).map(item=>item.name)}
-async function downloadArchive(){const selected=archiveScopeNames(); if(!selected.length){setStatus('Select at least one archive item'); return} const response=await fetch('/api/archive/export?'+archiveScopeParams().toString()); if(!response.ok)throw new Error(await response.text()); const blob=await response.blob(); const url=URL.createObjectURL(blob); const link=document.createElement('a'); link.href=url; link.download='simpleagentchat-archive.zip'; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url); setStatus('Exported archive')}
+async function downloadArchive(){const selected=archiveScopeNames(); if(!selected.length){setStatus('Select at least one archive item'); return} const link=document.createElement('a'); link.href='/api/archive/export?'+archiveScopeParams().toString(); link.download='simpleagentchat-archive.zip'; document.body.appendChild(link); link.click(); link.remove(); setStatus('Export started')}
 async function importArchive(){const file=$('archiveFile').files[0]; if(!file){$('archiveFile').reportValidity?.(); $('archiveFile').focus(); return} const selected=archiveScopeNames(); if(!selected.length){setStatus('Select at least one archive item'); return} const mode=$('archiveModeReplace').checked?'replace':'merge'; const prompt=(mode==='replace'?'Replace selected existing content before import?':'Merge selected archive content into this room?')+'\n\nSelected: '+selected.join(', '); if(!confirm(prompt))return; const params=archiveScopeParams(); params.set('mode',mode); const response=await fetch('/api/archive/import?'+params.toString(),{method:'POST',body:file}); if(!response.ok)throw new Error(await response.text()); const result=await response.json(); await refreshAll(); setStatus('Imported '+text(result.counts?.total||0)+' files')}
+// 08 - Live events and startup
 function connectEvents(){if(!window.EventSource){setInterval(()=>{loadNewMessages().catch(e=>setStatus(e.message)); loadGoals().catch(e=>setStatus(e.message))},30000); return} const events=new EventSource('/api/events'); events.onopen=()=>setStatus('Live'); events.addEventListener('messages',()=>loadNewMessages().catch(e=>setStatus(e.message))); events.addEventListener('roles',()=>{loadRoles().catch(e=>setStatus(e.message)); loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('goals',()=>{loadGoals().catch(e=>setStatus(e.message)); loadNewMessages().catch(e=>setStatus(e.message))}); events.addEventListener('assets',()=>loadAssets().catch(e=>setStatus(e.message))); events.onerror=()=>setStatus('Reconnecting')}
 refreshAll().catch(e=>setStatus(e.message));
 connectEvents();
@@ -5124,14 +5529,28 @@ internal static class Markdown
     }
 }
 
+#endregion
+
+#region 10 - Atomic I/O, Locking, Retry, Time, and JSON Helpers
+
 internal static class Atomic
 {
     public static void WriteText(string path, string text)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var tempPath = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
-        File.WriteAllText(tempPath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-        File.Move(tempPath, path, overwrite: true);
+        try
+        {
+            File.WriteAllText(tempPath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.Move(tempPath, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
     }
 
     public static async Task WriteTextAsync(string path, string text)
@@ -5142,6 +5561,75 @@ internal static class Atomic
         await writer.WriteAsync(text);
         await writer.FlushAsync();
         stream.Flush(flushToDisk: true);
+    }
+}
+
+internal static class WorkspaceLock
+{
+    private const string LockFileName = "mutation.lock";
+
+    public static async Task<IDisposable> AcquireAsync(ChatWorkspace workspace, int waitMs)
+    {
+        var locksDirectory = Path.Combine(workspace.ChatDir, ".locks");
+        Directory.CreateDirectory(locksDirectory);
+        var lockPath = Path.Combine(locksDirectory, LockFileName);
+        var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
+        Exception? last = null;
+
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException ex)
+            {
+                last = ex;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                last = ex;
+            }
+
+            if (waitMs == 0 || DateTime.UtcNow >= deadline)
+            {
+                throw CliException.LockTimeout(last?.Message ?? "Timed out waiting for the simpleagentchat mutation lock.");
+            }
+
+            await Task.Delay(75);
+        }
+    }
+
+    public static IDisposable Acquire(ChatWorkspace workspace, int waitMs)
+    {
+        var locksDirectory = Path.Combine(workspace.ChatDir, ".locks");
+        Directory.CreateDirectory(locksDirectory);
+        var lockPath = Path.Combine(locksDirectory, LockFileName);
+        var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
+        Exception? last = null;
+
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException ex)
+            {
+                last = ex;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                last = ex;
+            }
+
+            if (waitMs == 0 || DateTime.UtcNow >= deadline)
+            {
+                throw CliException.LockTimeout(last?.Message ?? "Timed out waiting for the simpleagentchat mutation lock.");
+            }
+
+            Thread.Sleep(75);
+        }
     }
 }
 
@@ -5179,8 +5667,10 @@ internal static class Retry
 
 internal static class Time
 {
+    public const string RoundTripFormat = "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'";
+
     public static string UtcNowRoundTrip() => RoundTrip(DateTimeOffset.UtcNow);
-    public static string RoundTrip(DateTimeOffset value) => value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+    public static string RoundTrip(DateTimeOffset value) => value.UtcDateTime.ToString(RoundTripFormat, CultureInfo.InvariantCulture);
 }
 
 internal static class Json
@@ -5196,4 +5686,6 @@ internal static class Json
 
     public static string Text<T>(T value) => JsonSerializer.Serialize(value, Options);
 }
+
+#endregion
 }

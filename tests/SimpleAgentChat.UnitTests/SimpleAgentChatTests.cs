@@ -1,5 +1,7 @@
 namespace SimpleAgentChat.Tests;
 
+using System.Globalization;
+using System.IO.Compression;
 using SimpleAgentChat;
 
 internal static class SimpleAgentChatTests
@@ -19,13 +21,17 @@ internal static class SimpleAgentChatTests
             ("markdown renderer covers common chat shapes", TestMarkdownCommonShapes),
             ("initialization creates implementer and reviewer default roles", TestDefaultRoles),
             ("initialization moves legacy root how-to-chat guide", TestInitializationMovesLegacyHowToChat),
-            ("how-to-chat tells agents to keep listening", TestHowToChatRequiresListening),
+            ("how-to-chat explains shared runner and active-session lifecycle", TestHowToChatRequiresListening),
             ("role join prompt clearly explains how to join", TestRoleJoinPromptIsClear),
             ("resource operations manage roles goals and assets", TestResourceOperationsManageFiles),
             ("archive operations export and import selected room files", TestArchiveOperations),
+            ("failed replace imports restore the previous room content", TestFailedReplaceImportRollsBack),
             ("ui shell exposes single role save, export, and management controls", TestUiShellManagementControls),
             ("chat html is generated only by explicit export", TestChatHtmlExplicitExport),
+            ("cursor fetch wakes when a new message file arrives", TestCursorFetchWakesOnMessage),
+            ("cursor allocation follows serialized commit order", TestCursorAllocationFollowsCommitOrder),
             ("goal status store computes current role completion", TestGoalStatusStore),
+            ("concurrent goal approvals preserve every role status", TestConcurrentGoalApprovals),
             ("goal edit guidance resets approvals", TestGoalEditGuidanceResetsApprovals)
         };
 
@@ -95,6 +101,11 @@ internal static class SimpleAgentChatTests
 
         AssertThrows<CliException>(() => FetchArgs.Parse(new[] { "0" }), "invalid cursor should fail");
         AssertThrows<CliException>(() => FetchArgs.Parse(new[] { cursor, "5", "--wait-ms", "6" }), "duplicate wait should fail");
+
+        var join = JoinArgs.Parse(new[] { "reviewer", "--json" });
+        AssertEqual("reviewer", join.Role, "join role");
+        Assert(join.Json, "join json");
+        AssertThrows<CliException>(() => JoinArgs.Parse(new[] { "human" }), "join should reject reserved roles");
         return Task.CompletedTask;
     }
 
@@ -257,17 +268,16 @@ internal static class SimpleAgentChatTests
             Assert(reviewerInstructions.Contains("keep polling every 2-3 minutes while reviewing", StringComparison.Ordinal), "reviewer should keep polling during work");
             Assert(reviewerInstructions.Contains("Announce review findings or shared-state changes", StringComparison.Ordinal), "reviewer should announce meaningful findings");
 
-            var reviewerSource = workspace.RoleSourcePath("reviewer");
-            Assert(File.Exists(reviewerSource), "reviewer role source copy should exist");
-            Assert(File.ReadAllText(reviewerSource).Contains("role runner smoke", StringComparison.Ordinal), "reviewer role source should match repo source");
-            Assert(File.Exists(workspace.RoleRunnerDllPath("reviewer")), "reviewer runner DLL should exist");
+            Assert(File.Exists(workspace.RunnerSourcePath), "shared runner source copy should exist");
+            Assert(File.ReadAllText(workspace.RunnerSourcePath).Contains("role runner smoke", StringComparison.Ordinal), "shared runner source should match repo source");
+            Assert(File.Exists(workspace.RunnerDllPath), "shared runner DLL should exist");
             Assert(File.Exists(workspace.HowToChatPath), "how-to-chat guide should exist inside .simpleagentchat");
             Assert(Path.GetFullPath(workspace.HowToChatPath).StartsWith(Path.GetFullPath(workspace.ChatDir), StringComparison.OrdinalIgnoreCase), "how-to-chat guide should live under .simpleagentchat");
             Assert(!File.Exists(Path.Combine(root, "HOW_TO_CHAT.md")), "root how-to-chat guide should not be generated");
             var agentsBlock = File.ReadAllText(workspace.AgentsPath);
             Assert(agentsBlock.Contains("`.simpleagentchat/HOW_TO_CHAT.md`", StringComparison.Ordinal), "AGENTS.md should point at the room-local how-to-chat guide");
-            Assert(agentsBlock.Contains("always keep polling until you are explicitly instructed not to", StringComparison.Ordinal), "AGENTS.md should include the simpleagentchat polling reminder");
-            Assert(agentsBlock.Contains("If a long poll returns no messages or times out, continue polling", StringComparison.Ordinal), "AGENTS.md should mention empty long-poll responses");
+            Assert(agentsBlock.Contains("While actively working in simpleagentchat mode", StringComparison.Ordinal), "AGENTS.md should scope polling to active work");
+            Assert(agentsBlock.Contains("perform one final fetch and then leave", StringComparison.Ordinal), "AGENTS.md should explain the session exit condition");
             Assert(agentsBlock.Contains("always announce whenever something you do might be of meaningful interest to others", StringComparison.Ordinal), "AGENTS.md should include the meaningful-interest announcement reminder");
             Assert(agentsBlock.Contains("code changes, environment changes, test results, or other shared state changes", StringComparison.Ordinal), "AGENTS.md should include examples of meaningful-interest events");
         }
@@ -285,22 +295,19 @@ internal static class SimpleAgentChatTests
     private static Task TestHowToChatRequiresListening()
     {
         var block = MarkdownBlocks.HowToChatBlock();
-        Assert(block.Contains("Always run chat commands through your role-local runner", StringComparison.Ordinal), "role-local runner command guidance missing");
+        Assert(block.Contains("Always run chat commands through the prebuilt shared runner", StringComparison.Ordinal), "shared runner command guidance missing");
         Assert(block.Contains("replace it with your assigned role name", StringComparison.Ordinal), "role replacement guidance missing");
-        Assert(block.Contains(".simpleagentchat/roles/<role>/simpleagentchat-<role>.cs", StringComparison.Ordinal), "role source copy guidance missing");
-        Assert(block.Contains(".simpleagentchat/roles/<role>/runner/", StringComparison.Ordinal), "role runner folder guidance missing");
+        Assert(block.Contains(".simpleagentchat/simpleagentchat-runner.cs", StringComparison.Ordinal), "shared source copy guidance missing");
+        Assert(block.Contains(".simpleagentchat/runner/", StringComparison.Ordinal), "shared runner folder guidance missing");
         Assert(block.Contains("The contention happens in the .NET file-based app build cache, not in simpleagentchat's message files", StringComparison.Ordinal), "cache contention explanation missing");
-        Assert(block.Contains("agents run the already-built DLL", StringComparison.Ordinal), "already-built runner explanation missing");
-        Assert(block.Contains("If your role-local runner is missing", StringComparison.Ordinal), "missing runner stop guidance missing");
+        Assert(block.Contains("one already-built runner DLL", StringComparison.Ordinal), "already-built runner explanation missing");
+        Assert(block.Contains("If the shared runner is missing", StringComparison.Ordinal), "missing runner stop guidance missing");
         Assert(block.Contains("Do not repair `%TEMP%\\dotnet\\runfile` by hand", StringComparison.Ordinal), "runfile cache warning missing");
-        Assert(block.Contains("CRITICAL: once you join, keep listening for new chat messages until a human or system message explicitly tells your role to stop listening", StringComparison.Ordinal), "join listening warning missing");
-        Assert(block.Contains("Do not stop just because all current goals are done; new goals can appear after completion", StringComparison.Ordinal), "goal-completion polling warning missing");
-        Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch --wait-ms 0 --json", StringComparison.Ordinal), "initial fetch should return immediately");
-        Assert(block.Contains("dotnet .simpleagentchat/roles/reviewer/runner/simpleagentchat-reviewer.dll fetch <nextCursor> --wait-ms 600000 --json", StringComparison.Ordinal), "role runner long wait example missing");
-        Assert(block.Contains("repeat it after timeouts", StringComparison.Ordinal), "timeout repeat guidance missing");
-        Assert(block.Contains("until a fetched message explicitly tells you not to listen", StringComparison.Ordinal), "listening stop condition missing");
-        Assert(block.Contains("Goal completion is not a stop signal; continue polling after all current goals are done because new goals can be added", StringComparison.Ordinal), "post-goal polling guidance missing");
-        Assert(!block.Contains("until the goal is done", StringComparison.Ordinal), "goal completion should not be a polling stop condition");
+        Assert(block.Contains("join reviewer --json", StringComparison.Ordinal), "one-step join guidance missing");
+        Assert(block.Contains("dotnet .simpleagentchat/runner/simpleagentchat-runner.dll fetch --wait-ms 0 --json", StringComparison.Ordinal), "initial fetch should return immediately");
+        Assert(block.Contains("dotnet .simpleagentchat/runner/simpleagentchat-runner.dll fetch <nextCursor> --wait-ms 600000 --json", StringComparison.Ordinal), "shared runner long wait example missing");
+        Assert(block.Contains("Continue polling while you are actively working or have been asked to monitor the room", StringComparison.Ordinal), "active polling condition missing");
+        Assert(block.Contains("After the handoff, perform one final fetch", StringComparison.Ordinal), "session exit guidance missing");
         Assert(block.Contains("at least every 2-3 minutes while you are doing actual work", StringComparison.Ordinal), "during-work polling cadence missing");
         Assert(block.Contains("inform the chat when you complete a large or important chunk of work", StringComparison.Ordinal), "important progress update guidance missing");
         Assert(block.Contains("find anything of interest, are about to make a big change, or want the opinion of other participants", StringComparison.Ordinal), "meaningful interest guidance missing");
@@ -325,15 +332,13 @@ internal static class SimpleAgentChatTests
             Assert(prompt.Contains("Assigned role: reviewer", StringComparison.Ordinal), "prompt should include assigned role");
             Assert(prompt.Contains("Do not run the root `simpleagentchat.cs` file for chat commands", StringComparison.Ordinal), "prompt should steer away from the root file runner");
             Assert(prompt.Contains("Read `.simpleagentchat/HOW_TO_CHAT.md`", StringComparison.Ordinal), "prompt should tell agents to read the protocol guide");
-            Assert(prompt.Contains("Read the current overall goals in `.simpleagentchat/goals/`", StringComparison.Ordinal), "prompt should tell agents to read goals");
-            Assert(prompt.Contains("`.simpleagentchat/roles/reviewer/instructions.md`", StringComparison.Ordinal), "prompt should include role instructions path");
-            Assert(prompt.Contains("`.simpleagentchat/roles/reviewer/role_memory.md`", StringComparison.Ordinal), "prompt should include role memory path");
-            Assert(prompt.Contains("fetch --wait-ms 0 --json", StringComparison.Ordinal), "prompt should include immediate first fetch command");
+            Assert(prompt.Contains("join reviewer --json", StringComparison.Ordinal), "prompt should include the one-step join command");
+            Assert(prompt.Contains("`.simpleagentchat/roles/reviewer`", StringComparison.Ordinal), "prompt should include the role directory");
             Assert(prompt.Contains("announce yourself briefly", StringComparison.Ordinal), "prompt should include conditional self-announcement");
-            Assert(prompt.Contains("keep polling/fetching for other messages", StringComparison.Ordinal), "prompt should include ongoing polling guidance");
+            Assert(prompt.Contains("poll/fetch for other messages at meaningful checkpoints", StringComparison.Ordinal), "prompt should include active polling guidance");
             Assert(prompt.Contains("at least every 2-3 minutes while doing actual work", StringComparison.Ordinal), "prompt should include during-work polling cadence");
             Assert(prompt.Contains("fetch <nextCursor> --wait-ms 600000 --json", StringComparison.Ordinal), "prompt should include long-poll command");
-            Assert(prompt.Contains("If a long poll returns no messages or times out, continue polling", StringComparison.Ordinal), "prompt should include empty long-poll guidance");
+            Assert(prompt.Contains("After your handoff, perform one final fetch", StringComparison.Ordinal), "prompt should include exit guidance");
             Assert(prompt.Contains("find anything of interest, are about to make a big change, or want the opinion of other participants", StringComparison.Ordinal), "prompt should include meaningful announcement guidance");
             Assert(prompt.Contains("goal done reviewer <goal_file_name>", StringComparison.Ordinal), "prompt should include role-specific goal completion command");
         }
@@ -510,6 +515,54 @@ internal static class SimpleAgentChatTests
         }
     }
 
+    private static Task TestFailedReplaceImportRollsBack()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            File.WriteAllText(workspace.GoalPath("existing.md"), "# Existing\n");
+            File.WriteAllText(workspace.AssetPath("existing.txt"), "keep me");
+
+            var zipPath = Path.Combine(root, "invalid-room.zip");
+            using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+            {
+                using (var writer = new StreamWriter(archive.CreateEntry("goals/replacement.md").Open()))
+                {
+                    writer.Write("# Replacement\n");
+                }
+
+                using var oversized = archive.CreateEntry("assets/oversized.bin", CompressionLevel.Fastest).Open();
+                var buffer = new byte[64 * 1024];
+                var remaining = AssetLimits.MaxBytes + 1;
+                while (remaining > 0)
+                {
+                    var count = (int)Math.Min(buffer.Length, remaining);
+                    oversized.Write(buffer, 0, count);
+                    remaining -= count;
+                }
+            }
+
+            var scope = new ArchiveScope(false, true, false, false, true);
+            AssertThrows<CliException>(
+                () => ArchiveOperations.ImportFromFile(workspace, zipPath, ArchiveImportMode.Replace, scope),
+                "oversized archive import should fail");
+            Assert(File.Exists(workspace.GoalPath("existing.md")), "failed replace import should restore the existing goal");
+            AssertEqual("keep me", File.ReadAllText(workspace.AssetPath("existing.txt")), "failed replace import should restore the existing asset");
+            Assert(!File.Exists(workspace.GoalPath("replacement.md")), "failed replace import should not leave staged goals behind");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
     private static Task TestInitializationMovesLegacyHowToChat()
     {
         var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
@@ -632,6 +685,87 @@ internal static class SimpleAgentChatTests
         }
     }
 
+    private static async Task TestCursorFetchWakesOnMessage()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            var store = new MessageStore(workspace);
+            var first = await store.AppendAsync("implementer", "chat.message", "first", Array.Empty<string>(), 0);
+            var fetchTask = store.FetchAsync(first.Id, includeSystem: true, waitMs: 5000);
+            await Task.Delay(100);
+            var second = await store.AppendAsync("reviewer", "chat.message", "second", Array.Empty<string>(), 5000);
+            var response = await fetchTask;
+
+            Assert(!response.TimedOut, "new message should wake the cursor fetch");
+            AssertEqual(second.Id, response.NextCursor, "cursor should advance to the new message");
+            AssertEqual("second", response.Messages.Single().Markdown, "fetch should return only the newer message");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static async Task TestCursorAllocationFollowsCommitOrder()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            var store = new MessageStore(workspace);
+            using var appendStarted = new ManualResetEventSlim(false);
+            var mutationLock = WorkspaceLock.Acquire(workspace, 0);
+            try
+            {
+                var appendTask = Task.Run(async () =>
+                {
+                    appendStarted.Set();
+                    return await store.AppendAsync("implementer", "chat.message", "serialized after barrier", Array.Empty<string>(), 5000);
+                });
+
+                appendStarted.Wait();
+                await Task.Delay(100);
+
+                var future = DateTimeOffset.UtcNow.AddMinutes(5);
+                var barrierId = future.ToString("yyyyMMdd'T'HHmmss.fffffff'Z'", CultureInfo.InvariantCulture) + "-system-abcdef123456";
+                var barrier = new Message(
+                    barrierId,
+                    Time.RoundTrip(future),
+                    "system",
+                    "test.barrier",
+                    "committed first",
+                    Array.Empty<string>());
+                await store.WriteMessageFileNoRetryAsync(barrier);
+                MessageStore.AdvanceCursorHighWaterFromMessagesUnderLock(workspace);
+
+                mutationLock.Dispose();
+                var appended = await appendTask;
+                Assert(string.CompareOrdinal(appended.Id, barrier.Id) > 0, "message cursor should follow serialized commit order");
+
+                var fetched = await store.FetchAsync(barrier.Id, includeSystem: true, waitMs: 0);
+                AssertEqual(appended.Id, fetched.Messages.Single().Id, "fetch after the barrier should include the later commit");
+            }
+            finally
+            {
+                mutationLock.Dispose();
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task TestGoalStatusStore()
     {
         var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
@@ -674,6 +808,46 @@ internal static class SimpleAgentChatTests
         }
     }
 
+    private static async Task TestConcurrentGoalApprovals()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var workspace = ChatWorkspace.Initialize(root);
+            File.WriteAllText(workspace.GoalPath("concurrent.md"), "# Concurrent\n");
+            var goals = new GoalStatusStore(workspace);
+
+            for (var iteration = 0; iteration < 20; iteration++)
+            {
+                goals.ResetGoalForCurrentRoles("concurrent.md");
+                using var start = new ManualResetEventSlim(false);
+                var implementer = Task.Run(async () =>
+                {
+                    start.Wait();
+                    await goals.MarkRoleStatusAsync("concurrent.md", "implementer", "done", 5000);
+                });
+                var reviewer = Task.Run(async () =>
+                {
+                    start.Wait();
+                    await goals.MarkRoleStatusAsync("concurrent.md", "reviewer", "done", 5000);
+                });
+                start.Set();
+                await Task.WhenAll(implementer, reviewer);
+
+                var status = goals.GetStatus("concurrent.md");
+                Assert(status.Complete, $"concurrent approvals should both survive iteration {iteration}");
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static async Task TestGoalEditGuidanceResetsApprovals()
     {
         var root = Path.Combine(Path.GetTempPath(), "simpleagentchat-unit-" + Guid.NewGuid().ToString("N"));
@@ -688,7 +862,15 @@ internal static class SimpleAgentChatTests
             await goals.MarkRoleStatusAsync("release.md", "reviewer", "done", 0);
             Assert(goals.GetStatus("release.md").Complete, "setup should complete the goal");
 
-            var editedMessage = MessageStore.NewMessage("system", "goals.changed", GoalSystemMessages.Edited("release.md"), Array.Empty<string>());
+            Message editedMessage;
+            using (WorkspaceLock.Acquire(workspace, 0))
+            {
+                editedMessage = new MessageStore(workspace).NewMessageUnderLock(
+                    "system",
+                    "goals.changed",
+                    GoalSystemMessages.Edited("release.md"),
+                    Array.Empty<string>());
+            }
             goals.ResetGoalForCurrentRoles("release.md", editedMessage.TimestampUtc, editedMessage.Id);
             var reset = goals.GetStatus("release.md");
 

@@ -21,7 +21,7 @@
 ## Requirements
 
 - A Git repository.
-- A modern .NET SDK that can run file-based C# apps with `dotnet simpleagentchat.cs`.
+- The .NET 10 SDK or newer, with support for file-based C# apps.
 
 ## Quick Start
 
@@ -36,3 +36,21 @@ dotnet .\simpleagentchat.cs serve
 - Use the role panel's `Copy prompt` button, then paste that prompt into Claude, Codex, or your favorite harness.
 - Once everything is configured, say `Start` in the chat window.
 - Watch the magic happen.
+
+Agents use the shared prebuilt runner, so adding roles does not trigger another build:
+
+```powershell
+dotnet .\.simpleagentchat\runner\simpleagentchat-runner.dll join reviewer --json
+```
+
+`join` returns the role instructions, durable memory, goals, current approvals, prior public chat, whether the human has said `Start`, and the next fetch cursor in one response.
+
+## Development
+
+The distributable remains the single sectioned `simpleagentchat.cs` file. Run the repository verification command with:
+
+```powershell
+.\verify.ps1
+```
+
+The test project is intentionally a dependency-free console harness, so use `verify.ps1` or `dotnet run --project tests\SimpleAgentChat.UnitTests\SimpleAgentChat.UnitTests.csproj`; `dotnet test` does not execute this harness.
